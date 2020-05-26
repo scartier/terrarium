@@ -388,6 +388,12 @@ void loop()
 
 void updateUserSelection()
 {
+  if (buttonDoubleClicked())
+  {
+    // Reset our state and tell our neighbors to reset their perception of us
+    resetOurState();
+  }
+  
   if (buttonSingleClicked())
   {
     // User state changed
