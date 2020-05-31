@@ -1,15 +1,20 @@
+// TODO
+// * Change sense of neighbor water level to be how much it can accept
+
 #define null 0
 //#define DEBUG_COMMS 1
 
-#define COLOR_DRIPPER makeColorRGB(  0, 255, 128)
-#define COLOR_DIRT    makeColorRGB(107,  80,   0)
-#define COLOR_BUG     makeColorRGB(107,  80,   0)
-#define COLOR_WATER   makeColorRGB(  0,   0, 128)
-#define COLOR_WATER_FULL makeColorRGB(0,  128, 128)
+#define COLOR_DRIPPER     makeColorRGB(  0, 255, 128)
+#define COLOR_DIRT        makeColorRGB(107,  80,   0)
+#define COLOR_DIRT_FULL   makeColorRGB(107,  80,  32)
+#define COLOR_SUN         makeColorRGB(255, 255,   0)
+#define COLOR_BUG         makeColorRGB(107,  80,   0)
+#define COLOR_WATER       makeColorRGB(  0,   0, 128)
+#define COLOR_WATER_FULL  makeColorRGB(  0, 128, 128)
 
-#define COLOR_DEBUG1  makeColorRGB(255, 255, 0)
-#define COLOR_DEBUG2  makeColorRGB(255, 0, 255)
-#define COLOR_DEBUG3  makeColorRGB(0, 255, 255)
+#define COLOR_DEBUG1  makeColorRGB(255, 255, 0) // yellow
+#define COLOR_DEBUG2  makeColorRGB(255, 0, 255) // purple
+#define COLOR_DEBUG3  makeColorRGB(0, 255, 255) // cyan
 
 #define MAX(x,y) ((x) > (y) ? (x) : (y))
 #define MIN(x,y) ((x) < (y) ? (x) : (y))
@@ -21,26 +26,22 @@
 #define GRAVITY 200 // ms to fall from pixel to pixel
 Timer gravityTimer;
 
+// =================================================================================================
+//
+// SYSTEMS
+//
+// =================================================================================================
+
 // States the player can select for a tile
 // They cycle through by clicking the tile's button
 enum eTileState
 {
   kTileState_Empty,
   kTileState_Dripper,
+  kTileState_Dirt,
+  kTileState_Sun,
 
   kTileState_MAX
-};
-
-// New tile states can be discovered and enabled given certain conditions
-// -1 = the state can always be selected
-// 0 = the state is disabled
-// 1+ = the state has this many uses
-char tileStateEnables[]
-{
-  -1,   // Empty
-  -1,   // Dripper
-  
-  0     // MAX
 };
 
 // Current tile state - starts empty
@@ -51,16 +52,25 @@ char tileState = kTileState_Empty;
 //
 #define DRIPPER_AMOUNT 4
 #define DRIPPER_RATE 500   // ms between drips
-bool hasDripper = false;
+#define MAX_WATER_LEVEL 15 // water level can actually go above this, but will stop accepting new water
 Timer dripperTimer;
 
-#define MAX_WATER_LEVEL 15 // water level can actually go above this, but will stop accepting new water
+// -------------------------------------------------------------------------------------------------
+// DIRT/PLANT
+//
+#define MAX_DIRT_WATER 100
+byte dirtReservoir = 0;   // this is dirt-specific - might want to create a union for such things to not waste space
+#define DIRT_WATER_SEEP 8
 
 // -------------------------------------------------------------------------------------------------
+// SUN
+//
+
+// =================================================================================================
 //
 // COMMUNICATIONS
 //
-// -------------------------------------------------------------------------------------------------
+// =================================================================================================
 
 #define TOGGLE_COMMAND 1
 #define TOGGLE_DATA 0
@@ -91,6 +101,8 @@ struct FaceState
   byte waterLevelNeighbor;
   byte waterLevelNeighborNew;
 
+//  byte faceColor; // DEBUG
+
 #if DEBUG_COMMS
   byte ourState;
   byte neighborState;
@@ -105,8 +117,8 @@ FaceState faceStates[FACE_COUNT];
 enum CommandType
 {
   CommandType_None,         // no data
-  CommandType_WaterLevel,   // data=value
-  CommandType_WaterAdd,     // data=value
+  CommandType_WaterLevel,   // data=water level on this face
+  CommandType_WaterAdd,     // data=water level to add to the neighbor face
 #if DEBUG_COMMS
   CommandType_UpdateState,
 #endif
@@ -261,8 +273,19 @@ void updateCommOnFaces()
             faceState->neighborSyncFlags |= NeighborSyncFlag_GotWater;
             break;
           case CommandType_WaterAdd:
-            faceState->waterLevel += value;
-            replaceOrEnqueueCommOnFace(f, CommandType_WaterLevel, faceState->waterLevel);
+            switch (tileState)
+            {
+              case kTileState_Empty:
+                // Normal tiles accumulate water in each face
+                faceState->waterLevel += value;
+                replaceOrEnqueueCommOnFace(f, CommandType_WaterLevel, faceState->waterLevel);
+                break;
+              case kTileState_Dirt:
+                // Dirt tiles have one large reservoir absorbed in the tile
+                dirtReservoir += value;
+                replaceOrEnqueueCommOnFace(f, CommandType_WaterLevel, getDirtWaterLevelToSend());
+                break;
+            }
             break;
 #if DEBUG_COMMS
           case CommandType_UpdateState:
@@ -368,8 +391,13 @@ void loop()
 #else
 
   // Systems updates
-  loopWater();
-  // TODO : MOAR
+  switch (tileState)
+  {
+    case kTileState_Empty:    loopWater();    break;
+    case kTileState_Dripper:  loopDripper();  break;
+    case kTileState_Dirt:     loopDirt();     break;
+    case kTileState_Sun:      loopSun();      break;
+  }  
 
   // Update water levels and such
   postProcessState();
@@ -400,14 +428,11 @@ void updateUserSelection()
 
     char prevTileState = tileState;
     
-    do
+    tileState++;
+    if (tileState >= kTileState_MAX)
     {
-      tileState++;
-      if (tileState >= kTileState_MAX)
-      {
-        tileState = 0;
-      }
-    } while (tileStateEnables[tileState] == 0);  // skip any disabled tile states
+      tileState = 0;
+    }
 
     // Reset our state and tell our neighbors to reset their perception of us
     resetOurState();
@@ -417,14 +442,12 @@ void updateUserSelection()
       switch (prevTileState)
       {
         case kTileState_Dripper:
-          hasDripper = false;
           break;
       }
 
       switch (tileState)
       {
         case kTileState_Dripper:
-          hasDripper = true;
           dripperTimer.set(DRIPPER_RATE);   // start dripping
           break;
       }
@@ -438,11 +461,21 @@ void resetOurState()
   {
     FaceState *faceState = &faceStates[f];
 
-    faceState->waterLevel = 0;
-    faceState->waterLevelNew = 0;
-    
     // Clear sync flags dealing with our state
     faceState->neighborSyncFlags &= ~NeighborSyncFlag_SentWater;
+
+    switch (tileState)
+    {
+      case kTileState_Empty:
+        faceState->waterLevel = 0;
+        faceState->waterLevelNew = 0;
+        break;
+        
+      case kTileState_Dirt:
+        faceState->waterLevel = MAX_WATER_LEVEL;
+        dirtReservoir = 0;
+        break;
+    }
   }
 }
 
@@ -496,7 +529,29 @@ void postProcessState()
     {
       if (!(faceState->neighborSyncFlags & NeighborSyncFlag_SentWater))
       {
-        replaceOrEnqueueCommOnFace(f, CommandType_WaterLevel, faceState->waterLevel);
+        byte waterLevel = faceState->waterLevel;
+        switch (tileState)
+        {
+          case kTileState_Empty:
+            // Empty tile uses actual water level
+            break;
+          
+          case kTileState_Dripper:
+            // Drippers cannot accept water - it just falls around them
+            waterLevel = MAX_WATER_LEVEL;
+            break;
+
+          case kTileState_Sun:
+            // Suns destroy water that falls in - it is always empty
+            waterLevel = 0;
+            break;
+            
+          case kTileState_Dirt:
+            // Dirt absorbs water over the entire tile
+            waterLevel = getDirtWaterLevelToSend();
+            break;
+        }
+        replaceOrEnqueueCommOnFace(f, CommandType_WaterLevel, waterLevel);
         faceState->neighborSyncFlags |= NeighborSyncFlag_SentWater;
       }
     }
@@ -514,22 +569,33 @@ void postProcessState()
 //
 // =================================================================================================
 
-void loopWater()
-{  
-  if (hasDripper)
+void loopDripper()
+{
+  if (dripperTimer.isExpired())
   {
-    if (dripperTimer.isExpired())
+    dripperTimer.set(DRIPPER_RATE);
+
+    // Send out water in all six directions, if there is room to accommodate
+    FOREACH_FACE(f)
     {
-      dripperTimer.set(DRIPPER_RATE);
-      if (faceStates[0].waterLevel < MAX_WATER_LEVEL)
+      if (NeighborSynced(f))
       {
-        byte waterToAdd = MAX_WATER_LEVEL - faceStates[0].waterLevel;
-        waterToAdd = MIN(waterToAdd, DRIPPER_AMOUNT);
-        faceStates[0].waterLevel += waterToAdd;
+        // Temporarily reduce our water level to the amount we want to send out
+        faceStates[f].waterLevel = DRIPPER_AMOUNT;
+        // Don't care about the return value - the dripper doesn't care if water actually flowed
+        tryFlowWater(&faceStates[f].waterLevel, &faceStates[f].waterLevelNeighbor, &faceStates[f].waterLevelNeighborNew, DRIPPER_AMOUNT);
+
+        // Restore our water level to "full"
+        // Water should flow around us
+        faceStates[f].waterLevel = MAX_WATER_LEVEL;
+        //replaceOrEnqueueCommOnFace(f, CommandType_WaterLevel, MAX_WATER_LEVEL);
       }
     }
   }
+}
 
+void loopWater()
+{
   // Make water fall/flow
   if (gravityTimer.isExpired())
   {
@@ -540,108 +606,168 @@ void loopWater()
     // Bottom row first (to make room for the top row)
     if (NeighborSynced(3))
     {
-      waterFallDown(3, &faceStates[3].waterLevelNeighbor, &faceStates[3].waterLevelNeighborNew);
+      if (tryFlowWater(&faceStates[3].waterLevel, &faceStates[3].waterLevelNeighbor, &faceStates[3].waterLevelNeighborNew, MAX_WATER_LEVEL) > 0)
+      {
+        replaceOrEnqueueCommOnFace(3, CommandType_WaterLevel, faceStates[3].waterLevel);
+      }
     }
     // Top row last
-    waterFallDown(0, &faceStates[3].waterLevel, &faceStates[3].waterLevelNew);
-    waterFallDown(1, &faceStates[2].waterLevel, &faceStates[2].waterLevelNew);
-    waterFallDown(5, &faceStates[4].waterLevel, &faceStates[4].waterLevelNew);
+    if (tryFlowWater(&faceStates[0].waterLevel, &faceStates[3].waterLevel, &faceStates[3].waterLevelNew, MAX_WATER_LEVEL) > 0)
+    {
+      replaceOrEnqueueCommOnFace(0, CommandType_WaterLevel, faceStates[0].waterLevel);
+    }
+    if (tryFlowWater(&faceStates[1].waterLevel, &faceStates[2].waterLevel, &faceStates[2].waterLevelNew, MAX_WATER_LEVEL) > 0)
+    {
+      replaceOrEnqueueCommOnFace(1, CommandType_WaterLevel, faceStates[1].waterLevel);
+    }
+    if (tryFlowWater(&faceStates[5].waterLevel, &faceStates[4].waterLevel, &faceStates[4].waterLevelNew, MAX_WATER_LEVEL) > 0)
+    {
+      replaceOrEnqueueCommOnFace(5, CommandType_WaterLevel, faceStates[5].waterLevel);
+    }
 
     // FLOW TO SIDES
-    waterFlowToSide(5,
-                    &faceStates[0].waterLevel,
-                    &faceStates[0].waterLevelNew,
-                    NeighborSynced(5) ? &faceStates[5].waterLevelNeighbor : null,
-                    &faceStates[5].waterLevelNeighborNew);
-    waterFlowToSide(4,
-                    &faceStates[3].waterLevel,
-                    &faceStates[3].waterLevelNew,
-                    NeighborSynced(4) ? &faceStates[4].waterLevelNeighbor : null,
-                    &faceStates[4].waterLevelNeighborNew);
-    waterFlowToSide(0,
-                    &faceStates[5].waterLevel,
-                    &faceStates[5].waterLevelNew,
-                    &faceStates[1].waterLevel,
-                    &faceStates[1].waterLevelNew);
-    waterFlowToSide(3,
-                    &faceStates[4].waterLevel,
-                    &faceStates[4].waterLevelNew,
-                    &faceStates[2].waterLevel,
-                    &faceStates[2].waterLevelNew);
-    waterFlowToSide(1,
-                    &faceStates[0].waterLevel,
-                    &faceStates[0].waterLevelNew,
-                    NeighborSynced(1) ? &faceStates[1].waterLevelNeighbor : null,
-                    &faceStates[1].waterLevelNeighborNew);
-    waterFlowToSide(2,
-                    &faceStates[3].waterLevel,
-                    &faceStates[3].waterLevelNew,
-                    NeighborSynced(2) ? &faceStates[2].waterLevelNeighbor : null,
-                    &faceStates[2].waterLevelNeighborNew);
+    waterFlowToSides(5,
+                     &faceStates[0].waterLevel,
+                     &faceStates[0].waterLevelNew,
+                     NeighborSynced(5) ? &faceStates[5].waterLevelNeighbor : null,
+                     &faceStates[5].waterLevelNeighborNew);
+    waterFlowToSides(4,
+                     &faceStates[3].waterLevel,
+                     &faceStates[3].waterLevelNew,
+                     NeighborSynced(4) ? &faceStates[4].waterLevelNeighbor : null,
+                     &faceStates[4].waterLevelNeighborNew);
+    waterFlowToSides(0,
+                     &faceStates[5].waterLevel,
+                     &faceStates[5].waterLevelNew,
+                     &faceStates[1].waterLevel,
+                     &faceStates[1].waterLevelNew);
+    waterFlowToSides(3,
+                     &faceStates[4].waterLevel,
+                     &faceStates[4].waterLevelNew,
+                     &faceStates[2].waterLevel,
+                     &faceStates[2].waterLevelNew);
+    waterFlowToSides(1,
+                     &faceStates[0].waterLevel,
+                     &faceStates[0].waterLevelNew,
+                     NeighborSynced(1) ? &faceStates[1].waterLevelNeighbor : null,
+                     &faceStates[1].waterLevelNeighborNew);
+    waterFlowToSides(2,
+                     &faceStates[3].waterLevel,
+                     &faceStates[3].waterLevelNew,
+                     NeighborSynced(2) ? &faceStates[2].waterLevelNeighbor : null,
+                     &faceStates[2].waterLevelNeighborNew);
   }
 }
 
-void waterFallDown(char srcPixel, byte *dst, byte *dstNew)
+byte tryFlowWater(byte *srcWaterLevel, byte *dst, byte *dstNew, byte maxAmount)
 {
-  if (faceStates[srcPixel].waterLevel <= 0)
+  if (*srcWaterLevel <= 0)
   {
-    return;   // no water here to fall
+    return 0;   // no water here to fall
   }
 
   byte dstTotal = *dst + *dstNew;
   if (dstTotal >= MAX_WATER_LEVEL)
   {
-    return;   // no room in destination to accept more water
+    return 0;   // no room in destination to accept more water
   }
 
   // All water falls, if possible, up to the maximum the destination can hold
-  int waterAmount = MIN(MAX_WATER_LEVEL - dstTotal, faceStates[srcPixel].waterLevel);
+  int waterAmount = MIN(MAX_WATER_LEVEL - dstTotal, *srcWaterLevel);
+  waterAmount = MIN(waterAmount, maxAmount);
   
   // Move the water!
-  faceStates[srcPixel].waterLevel -= waterAmount;
+  *srcWaterLevel -= waterAmount;
   *dstNew += waterAmount;
 
-  // The source water level changed - notify its neighbor
-  replaceOrEnqueueCommOnFace(srcPixel, CommandType_WaterLevel, faceStates[srcPixel].waterLevel);
+  return waterAmount;
 }
 
-void waterFlowToSide(char srcPixel, byte *dst1, byte *dst1New, byte *dst2, byte *dst2New)
+void waterFlowToSides(char srcPixel, byte *dst1, byte *dst1New, byte *dst2, byte *dst2New)
 {
-  // ASSUMPTION : All water has fallen down that was able to.
-  //              This means that any remaining water can flow to the side.
-  byte srcVal = faceStates[srcPixel].waterLevel;
-  
-  if (srcVal == 0)
+  if (tryFlowWater(&faceStates[srcPixel].waterLevel, dst1, dst1New, faceStates[srcPixel].waterLevel >> 1) > 0)
   {
-    return;   // no water here to flow
-  }
-  
-  char dst1Total = *dst1 + *dst1New;
-  if (dst1Total < MAX_WATER_LEVEL)
-  {
-    // Give half our water to either side, up to the max the destination can hold
-    char waterAmount = MIN(srcVal >> 1, MAX_WATER_LEVEL - dst1Total);
-    *dst1New += waterAmount;
-    faceStates[srcPixel].waterLevel -= waterAmount;
-    
-    // The source water level changed - notify its neighbor
     replaceOrEnqueueCommOnFace(srcPixel, CommandType_WaterLevel, faceStates[srcPixel].waterLevel);
   }
-
   if (dst2 != null)
   {
-    char dst2Total = *dst2 + *dst2New;
-    if (dst2Total < MAX_WATER_LEVEL)
+    if (tryFlowWater(&faceStates[srcPixel].waterLevel, dst2, dst2New, faceStates[srcPixel].waterLevel >> 1) > 0)
     {
-      // Give half our water to either side, up to the max the destination can hold
-      char waterAmount = MIN(srcVal >> 1, MAX_WATER_LEVEL - dst2Total);
-      *dst2New += waterAmount;
-      faceStates[srcPixel].waterLevel -= waterAmount;
-      
-      // The source water level changed - notify its neighbor
       replaceOrEnqueueCommOnFace(srcPixel, CommandType_WaterLevel, faceStates[srcPixel].waterLevel);
     }
   }
+}
+
+// =================================================================================================
+//
+// DIRT/PLANT
+//
+// =================================================================================================
+
+void loopDirt()
+{
+  // Once saturated, dirt tiles will seep water
+  if (gravityTimer.isExpired())
+  {
+    if (dirtReservoir >= MAX_DIRT_WATER)
+    {
+      if (NeighborSynced(2))
+      {
+        tryFlowWater(&dirtReservoir, &faceStates[2].waterLevelNeighbor, &faceStates[2].waterLevelNeighborNew, DIRT_WATER_SEEP);
+      }
+      if (NeighborSynced(3))
+      {
+        tryFlowWater(&dirtReservoir, &faceStates[3].waterLevelNeighbor, &faceStates[3].waterLevelNeighborNew, DIRT_WATER_SEEP);
+      }
+      if (NeighborSynced(4))
+      {
+        tryFlowWater(&dirtReservoir, &faceStates[4].waterLevelNeighbor, &faceStates[4].waterLevelNeighborNew, DIRT_WATER_SEEP);
+      }
+    }
+
+    // If water seeped out, tell our neighbors that we can accept more
+    if (dirtReservoir < MAX_DIRT_WATER)
+    {
+      byte waterLevel = getDirtWaterLevelToSend();
+      FOREACH_FACE(f)
+      {
+        replaceOrEnqueueCommOnFace(f, CommandType_WaterLevel, waterLevel);
+      }
+    }
+  }
+}
+
+byte getDirtWaterLevelToSend()
+{
+  byte waterLevel = 0;
+  
+  // Dirt absorbs water over the entire tile
+  if (dirtReservoir >= MAX_DIRT_WATER)
+  {
+    // Tile has absorbed all the water it can
+    waterLevel = MAX_WATER_LEVEL;
+  }
+  else if (MAX_DIRT_WATER - dirtReservoir >= MAX_WATER_LEVEL)
+  {
+    // Tile has room to accept the max level of water that can be sent
+    waterLevel = 0;
+  }
+  else
+  {
+    // Somewhere in between
+    waterLevel = MAX_DIRT_WATER - dirtReservoir;
+  }
+
+  return waterLevel;
+}
+// =================================================================================================
+//
+// SUN
+//
+// =================================================================================================
+
+void loopSun()
+{
 }
 
 // =================================================================================================
@@ -672,23 +798,51 @@ void render()
           dimness = 255 - dimnessL;
         }
         dimness = dimness >> 1;
-        setColorOnFace(dim(COLOR_DRIPPER, dimness), 0);
+        setColor(dim(COLOR_DRIPPER, dimness));
+      }
+      break;
+
+    case kTileState_Dirt:
+      {
+        setColor(COLOR_DIRT);
+        if (dirtReservoir >= MAX_DIRT_WATER)
+        {
+          setColorOnFace(COLOR_DIRT_FULL, 2);
+          setColorOnFace(COLOR_DIRT_FULL, 3);
+          setColorOnFace(COLOR_DIRT_FULL, 4);
+        }
+      }
+      break;
+
+    case kTileState_Sun:
+      {
+        long curTime = millis();
+        byte dimness = curTime >> 2; // pulse every 1024 ms
+        if (curTime & 0x400)
+        {
+          dimness = 255 - dimness;  // pulse up and down alternating
+        }
+        dimness |= 0x1F;  // force a minimum of brightness
+        setColor(dim(COLOR_SUN, dimness));
       }
       break;
   }
 
-  FOREACH_FACE(f)
+  if (tileState == kTileState_Empty)
   {
-    if (faceStates[f].waterLevel > 0)
+    FOREACH_FACE(f)
     {
-      byte dimness = faceStates[f].waterLevel << 4;    // water level 1 = brightness 16
-      Color waterColor = dim(COLOR_WATER, dimness);
-      if (faceStates[f].waterLevel >= MAX_WATER_LEVEL)
+      if (faceStates[f].waterLevel > 0)
       {
-        // Special case for full water just so we can see it
-        waterColor = COLOR_WATER_FULL;
+        byte dimness = faceStates[f].waterLevel << 4;    // water level 1 = brightness 16
+        Color waterColor = dim(COLOR_WATER, dimness);
+        if (faceStates[f].waterLevel >= MAX_WATER_LEVEL)
+        {
+          // Special case for full water just so we can see it
+          waterColor = COLOR_WATER_FULL;
+        }
+        setColorOnFace(waterColor, f);
       }
-      setColorOnFace(waterColor, f);
     }
   }
 
@@ -699,6 +853,15 @@ void render()
     {
       setColorOnFace(makeColorRGB(255,0,0), f);
     }
+
+/*
+    switch (faceStates[f].faceColor)
+    {
+      case 1: setColorOnFace(COLOR_DEBUG1, f); break;
+      case 2: setColorOnFace(COLOR_DEBUG2, f); break;
+      case 3: setColorOnFace(COLOR_DEBUG3, f); break;
+    }
+    */
   }
 
 #if DEBUG_COMMS
