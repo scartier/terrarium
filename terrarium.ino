@@ -1,25 +1,52 @@
 // TODO
 // * Change sense of neighbor water level to be how much it can accept
+// * Add #ifdef to remove debug coloring
 
 #define null 0
 //#define DEBUG_COMMS 1
+//#define DEBUG_COLORS
+#define INCLUDE_BASE_TILES    1
+#define INCLUDE_SPECIAL_TILES 1
 
 #define COLOR_DRIPPER     makeColorRGB(  0, 255, 128)
 #define COLOR_DIRT        makeColorRGB(107,  80,   0)
+#ifdef DEBUG_COLORS
 #define COLOR_DIRT_FULL   makeColorRGB(107,  80,  32)
+#endif
 #define COLOR_SUN         makeColorRGB(255, 255,   0)
 #define COLOR_BUG         makeColorRGB(107,  80,   0)
 #define COLOR_WATER       makeColorRGB(  0,   0, 128)
+
+#ifdef DEBUG_COLORS
 #define COLOR_WATER_FULL  makeColorRGB(  0, 128, 128)
+#define COLOR_WATER_FULL1  makeColorRGB( 64, 0, 0)
+#define COLOR_WATER_FULL2  makeColorRGB(128, 0, 0)
+#define COLOR_WATER_FULL3  makeColorRGB(255, 0, 0)
+#define COLOR_WATER_FULL4  makeColorRGB(  0, 64, 0)
+#define COLOR_WATER_FULL5  makeColorRGB(  0, 128, 0)
+#define COLOR_WATER_FULL6  makeColorRGB(  0, 255, 0)
+#define COLOR_WATER_FULL7  makeColorRGB(  0, 0, 64)
+#define COLOR_WATER_FULL8  makeColorRGB(  0, 0, 128)
+#define COLOR_WATER_FULL9  makeColorRGB(  0, 0, 255)
+#endif
+
+#define COLOR_PLANT       makeColorRGB(  0, 128,   0)
+
+#ifdef DEBUG_COLORS
+#define COLOR_PLANT_GROWTH1 makeColorRGB(  128, 0,  64)
+#define COLOR_PLANT_GROWTH2 makeColorRGB(  64, 0,  128)
+#define COLOR_PLANT_GROWTH3 makeColorRGB(  64, 64,  64)
 
 #define COLOR_DEBUG1  makeColorRGB(255, 255, 0) // yellow
 #define COLOR_DEBUG2  makeColorRGB(255, 0, 255) // purple
 #define COLOR_DEBUG3  makeColorRGB(0, 255, 255) // cyan
+#endif
 
 #define MAX(x,y) ((x) > (y) ? (x) : (y))
 #define MIN(x,y) ((x) < (y) ? (x) : (y))
 
 #define OPPOSITE_FACE(f) (((f) < 3) ? ((f) + 3) : ((f) - 3))
+#define CCW_FROM_FACE(f, amt) (((f) - (amt)) + (((f) >= (amt)) ? 0 : 6))
 
 // Gravity is a constant velocity for now (not accelerative)
 // Might change that later if there's need
@@ -53,18 +80,62 @@ char tileState = kTileState_Empty;
 #define DRIPPER_AMOUNT 4
 #define DRIPPER_RATE 500   // ms between drips
 #define MAX_WATER_LEVEL 15 // water level can actually go above this, but will stop accepting new water
+
+#if INCLUDE_SPECIAL_TILES
 Timer dripperTimer;
+//byte maxDripperOutput = 90;
+#endif
+
+#define EVAPORATION_RATE 3000
+#define DIRT_EVAPORATION 4
+Timer evaporationTimer;
 
 // -------------------------------------------------------------------------------------------------
 // DIRT/PLANT
 //
 #define MAX_DIRT_WATER 100
-byte dirtReservoir = 0;   // this is dirt-specific - might want to create a union for such things to not waste space
+#if INCLUDE_SPECIAL_TILES
+byte dirtReservoir = 0;
+#endif
 #define DIRT_WATER_SEEP 8
+
+#define ENERGY_DIST_RATE 500
+#if INCLUDE_SPECIAL_TILES
+Timer energyDistTimer;
+#endif
+
+#define MAX_ENERGY_PER_TILE 24
+enum eBranchState
+{
+  kBranchState_Empty,
+  kBranchState_Leaf,
+  kBranchState_Branch,
+  kBranchState_Flower   // ??
+};
+struct BranchState
+{
+  eBranchState state : 2;
+  byte growthEnergy : 2;
+};
+struct PlantState
+{
+  byte rootFace : 3;
+  byte energyTotal : 5;
+  BranchState branches[3];
+};
+PlantState plantState;
+
+#define ENERGY_USE_RATE 5000
+Timer energyUseTimer;
 
 // -------------------------------------------------------------------------------------------------
 // SUN
 //
+#if INCLUDE_SPECIAL_TILES
+#define SUN_STRENGTH 8
+#define GENERATE_SUN_RATE 500
+Timer generateSunTimer;
+#endif
 
 // =================================================================================================
 //
@@ -117,8 +188,13 @@ FaceState faceStates[FACE_COUNT];
 enum CommandType
 {
   CommandType_None,         // no data
-  CommandType_WaterLevel,   // data=water level on this face
-  CommandType_WaterAdd,     // data=water level to add to the neighbor face
+  CommandType_WaterLevel,   // Tell Our Water Level : value=water level on this face
+  CommandType_WaterAdd,     // Add Water To Neighbor : value=water level to add to the neighbor face
+  CommandType_DistEnergy,   // Distribute Energy : value=energy
+  CommandType_SendSun,      // Send sunlight (sent from Sun tiles): value=sun amount
+  CommandType_SendSunCW,    // Send sunlight (sent from Sun tiles): value=sun amount (turns CW after one tile)
+  CommandType_SendSunCCW,   // Send sunlight (sent from Sun tiles): value=sun amount (turns CCW after one tile)
+  CommandType_GatherSun,    // Gather sun from leaves to root : value=sun amount
 #if DEBUG_COMMS
   CommandType_UpdateState,
 #endif
@@ -137,6 +213,7 @@ CommandAndData commQueues[FACE_COUNT][COMM_QUEUE_SIZE];
 
 #define COMM_INDEX_ERROR_OVERRUN 0xFF
 #define COMM_INDEX_OUT_OF_SYNC   0xFE
+#define COMM_DATA_OVERRUN        0xFD
 byte commInsertionIndexes[FACE_COUNT];
 
 #define ErrorOnFace(f) (commInsertionIndexes[f] > COMM_QUEUE_SIZE)
@@ -201,7 +278,7 @@ void sendValueOnFace(byte f, FaceValue faceValue)
 
 // Called by the main program when this tile needs to tell something to
 // a neighbor tile.
-void enqueueCommOnFace(byte f, CommandType commandType, byte data)
+void enqueueCommOnFace(byte f, CommandType commandType, byte data, bool clampToMax)
 {
   if (commInsertionIndexes[f] >= COMM_QUEUE_SIZE)
   {
@@ -210,6 +287,18 @@ void enqueueCommOnFace(byte f, CommandType commandType, byte data)
     return;
   }
 
+  if (data & 0xF0)
+  {
+    if (clampToMax)
+    {
+      data = 0xF;
+    }
+    else
+    {
+      commInsertionIndexes[f] = COMM_DATA_OVERRUN;
+    }
+  }
+  
   byte index = commInsertionIndexes[f];
   commQueues[f][index].command = commandType;
   commQueues[f][index].data = data;
@@ -272,21 +361,63 @@ void updateCommOnFaces()
             faceState->waterLevelNeighbor = value;
             faceState->neighborSyncFlags |= NeighborSyncFlag_GotWater;
             break;
+            
           case CommandType_WaterAdd:
             switch (tileState)
             {
               case kTileState_Empty:
                 // Normal tiles accumulate water in each face
                 faceState->waterLevel += value;
-                replaceOrEnqueueCommOnFace(f, CommandType_WaterLevel, faceState->waterLevel);
+                replaceOrEnqueueCommOnFace(f, CommandType_WaterLevel, faceState->waterLevel, true);
                 break;
+
+#if INCLUDE_SPECIAL_TILES
               case kTileState_Dirt:
                 // Dirt tiles have one large reservoir absorbed in the tile
                 dirtReservoir += value;
-                replaceOrEnqueueCommOnFace(f, CommandType_WaterLevel, getDirtWaterLevelToSend());
+                replaceOrEnqueueCommOnFace(f, CommandType_WaterLevel, getDirtWaterLevelToSend(), true);
                 break;
+#endif
             }
             break;
+            
+          case CommandType_DistEnergy:
+            if (tileState == kTileState_Empty)
+            {
+              // Can only accept the energy if there is no plant growing here, or if
+              // the energy is coming from the same root.
+              if (plantState.branches[0].state == kBranchState_Empty || plantState.rootFace == f)
+              {
+                // Clamp to max amount we can store
+                if ((MAX_ENERGY_PER_TILE - plantState.energyTotal) < value)
+                {
+                  plantState.energyTotal = MAX_ENERGY_PER_TILE;
+                }
+                else
+                {
+                  plantState.energyTotal += value;
+                }
+                plantState.rootFace = f;
+              }
+            }
+            break;
+
+          case CommandType_SendSun:
+            if (tileState == kTileState_Empty)
+            {
+              // Plant leaves absorb sunlight
+              // Send on the rest
+              if (plantState.energyTotal > 4)
+              {
+                //plantState.storedSun++;
+                if (plantState.energyTotal > 12)
+                {
+                  //plantState.storedSun += 2;
+                }
+              }
+            }
+            break;
+            
 #if DEBUG_COMMS
           case CommandType_UpdateState:
             faceState->ourState = value;
@@ -384,7 +515,7 @@ void loop()
     {
       byte nextVal = faceStates[f].neighborState == 2 ? 3 : 2;
       faceStates[f].neighborState = nextVal;
-      enqueueCommOnFace(f, CommandType_UpdateState, nextVal);
+      enqueueCommOnFace(f, CommandType_UpdateState, nextVal, true);
     }
     sendNewStateTimer.set(500);
   }
@@ -393,10 +524,18 @@ void loop()
   // Systems updates
   switch (tileState)
   {
-    case kTileState_Empty:    loopWater();    break;
+#if INCLUDE_BASE_TILES
+    case kTileState_Empty:
+      loopWater();
+      loopPlant();
+      break;
+#endif
+      
+#if INCLUDE_SPECIAL_TILES
     case kTileState_Dripper:  loopDripper();  break;
     case kTileState_Dirt:     loopDirt();     break;
     case kTileState_Sun:      loopSun();      break;
+#endif
   }  
 
   // Update water levels and such
@@ -421,7 +560,8 @@ void updateUserSelection()
     // Reset our state and tell our neighbors to reset their perception of us
     resetOurState();
   }
-  
+
+#if INCLUDE_SPECIAL_TILES
   if (buttonSingleClicked())
   {
     // User state changed
@@ -450,9 +590,14 @@ void updateUserSelection()
         case kTileState_Dripper:
           dripperTimer.set(DRIPPER_RATE);   // start dripping
           break;
+
+        case kTileState_Dirt:
+          energyDistTimer.set(ENERGY_DIST_RATE);
+          break;
       }
     }
   }  // buttonSingleClicked
+#endif
 }
 
 void resetOurState()
@@ -469,30 +614,56 @@ void resetOurState()
       case kTileState_Empty:
         faceState->waterLevel = 0;
         faceState->waterLevelNew = 0;
+        plantState.branches[0].state = kBranchState_Empty;
+        plantState.branches[1].state = kBranchState_Empty;
+        plantState.branches[2].state = kBranchState_Empty;
+        plantState.branches[0].growthEnergy = 0;
+        plantState.branches[1].growthEnergy = 0;
+        plantState.branches[2].growthEnergy = 0;
+        plantState.energyTotal = 0;
         break;
-        
+
+#if INCLUDE_SPECIAL_TILES
       case kTileState_Dirt:
         faceState->waterLevel = MAX_WATER_LEVEL;
         dirtReservoir = 0;
         break;
+#endif
     }
   }
+
+  // Remove all plant energy - causes all plants to die immediately
+  plantState.energyTotal = 0;
+
+  //maxDripperOutput = 90;
 }
 
 // Replace the data for the given command in the queue, if it exists.
 // Otherwise add it to the queue.
-void replaceOrEnqueueCommOnFace(byte f, CommandType commandType, byte data)
+void replaceOrEnqueueCommOnFace(byte f, CommandType commandType, byte data, bool clampToMax)
 {
   for (byte index = 0; index < commInsertionIndexes[f]; index++)
   {
     if (commQueues[f][index].command == commandType)
     {
+      if (data & 0xF0)
+      {
+        if (clampToMax)
+        {
+          data = 0xF;
+        }
+        else
+        {
+          commInsertionIndexes[f] = COMM_DATA_OVERRUN;
+        }
+      }
+
       commQueues[f][index].data = data;
       return;
     }
   }
 
-  enqueueCommOnFace(f, commandType, data);
+  enqueueCommOnFace(f, commandType, data, clampToMax);
 }
 
 void postProcessState()
@@ -504,11 +675,15 @@ void postProcessState()
     if (faceState->waterLevelNew > 0)
     {
       faceState->waterLevel += faceState->waterLevelNew;
+      if (faceState->waterLevel > MAX_WATER_LEVEL)
+      {
+        faceState->waterLevel = MAX_WATER_LEVEL;
+      }
       faceState->waterLevelNew = 0;
 
       if (NeighborSynced(f))
       {
-        replaceOrEnqueueCommOnFace(f, CommandType_WaterLevel, faceState->waterLevel);
+        replaceOrEnqueueCommOnFace(f, CommandType_WaterLevel, faceState->waterLevel, true);
       }
     }
 
@@ -516,7 +691,7 @@ void postProcessState()
     {
       if (NeighborSynced(f))
       {
-        replaceOrEnqueueCommOnFace(f, CommandType_WaterAdd, faceState->waterLevelNeighborNew);
+        replaceOrEnqueueCommOnFace(f, CommandType_WaterAdd, faceState->waterLevelNeighborNew, true);
       }
 
       // Temporarily modify our understanding of the neighbor water level until they actually update us
@@ -535,7 +710,8 @@ void postProcessState()
           case kTileState_Empty:
             // Empty tile uses actual water level
             break;
-          
+
+#if INCLUDE_SPECIAL_TILES
           case kTileState_Dripper:
             // Drippers cannot accept water - it just falls around them
             waterLevel = MAX_WATER_LEVEL;
@@ -550,11 +726,52 @@ void postProcessState()
             // Dirt absorbs water over the entire tile
             waterLevel = getDirtWaterLevelToSend();
             break;
+#endif
         }
-        replaceOrEnqueueCommOnFace(f, CommandType_WaterLevel, waterLevel);
+        replaceOrEnqueueCommOnFace(f, CommandType_WaterLevel, waterLevel, true);
         faceState->neighborSyncFlags |= NeighborSyncFlag_SentWater;
       }
     }
+  }
+
+  // Water evaporation/seepage
+  if (evaporationTimer.isExpired())
+  {
+    switch (tileState)
+    {
+      case kTileState_Empty:
+        FOREACH_FACE(f)
+        {
+          if (faceStates[f].waterLevel > 0)
+          {
+            faceStates[f].waterLevel--;
+            replaceOrEnqueueCommOnFace(f, CommandType_WaterLevel, faceStates[f].waterLevel, true);
+          }
+        }
+        break;
+
+#if INCLUDE_SPECIAL_TILES
+      case kTileState_Dirt:
+        if (dirtReservoir > 0)
+        {
+          dirtReservoir = (dirtReservoir < DIRT_EVAPORATION) ? 0 : (dirtReservoir - DIRT_EVAPORATION);
+          byte waterLevel = getDirtWaterLevelToSend();
+          FOREACH_FACE(f)
+          {
+            replaceOrEnqueueCommOnFace(f, CommandType_WaterLevel, waterLevel, true);
+          }
+        }
+        break;
+#endif
+    }
+    
+    evaporationTimer.set(EVAPORATION_RATE);
+  }
+
+  // Used by both dirt tiles and plants, so must go here
+  if (energyDistTimer.isExpired())
+  {
+    energyDistTimer.set(ENERGY_DIST_RATE);
   }
 
   if (gravityTimer.isExpired())
@@ -569,6 +786,7 @@ void postProcessState()
 //
 // =================================================================================================
 
+#if INCLUDE_SPECIAL_TILES
 void loopDripper()
 {
   if (dripperTimer.isExpired())
@@ -578,12 +796,22 @@ void loopDripper()
     // Send out water in all six directions, if there is room to accommodate
     FOREACH_FACE(f)
     {
+      /*
+      if (maxDripperOutput == 0)
+      {
+        break;
+      }
+      */
+        
       if (NeighborSynced(f))
       {
+        byte amtToSend = DRIPPER_AMOUNT;//MIN(maxDripperOutput, DRIPPER_AMOUNT);
+        
         // Temporarily reduce our water level to the amount we want to send out
-        faceStates[f].waterLevel = DRIPPER_AMOUNT;
+        faceStates[f].waterLevel = amtToSend;
         // Don't care about the return value - the dripper doesn't care if water actually flowed
-        tryFlowWater(&faceStates[f].waterLevel, &faceStates[f].waterLevelNeighbor, &faceStates[f].waterLevelNeighborNew, DRIPPER_AMOUNT);
+        byte amt = tryFlowWater(&faceStates[f].waterLevel, &faceStates[f].waterLevelNeighbor, &faceStates[f].waterLevelNeighborNew, amtToSend);
+        //maxDripperOutput -= amt;
 
         // Restore our water level to "full"
         // Water should flow around us
@@ -593,6 +821,7 @@ void loopDripper()
     }
   }
 }
+#endif
 
 void loopWater()
 {
@@ -608,21 +837,21 @@ void loopWater()
     {
       if (tryFlowWater(&faceStates[3].waterLevel, &faceStates[3].waterLevelNeighbor, &faceStates[3].waterLevelNeighborNew, MAX_WATER_LEVEL) > 0)
       {
-        replaceOrEnqueueCommOnFace(3, CommandType_WaterLevel, faceStates[3].waterLevel);
+        replaceOrEnqueueCommOnFace(3, CommandType_WaterLevel, faceStates[3].waterLevel, true);
       }
     }
     // Top row last
     if (tryFlowWater(&faceStates[0].waterLevel, &faceStates[3].waterLevel, &faceStates[3].waterLevelNew, MAX_WATER_LEVEL) > 0)
     {
-      replaceOrEnqueueCommOnFace(0, CommandType_WaterLevel, faceStates[0].waterLevel);
+      replaceOrEnqueueCommOnFace(0, CommandType_WaterLevel, faceStates[0].waterLevel, true);
     }
     if (tryFlowWater(&faceStates[1].waterLevel, &faceStates[2].waterLevel, &faceStates[2].waterLevelNew, MAX_WATER_LEVEL) > 0)
     {
-      replaceOrEnqueueCommOnFace(1, CommandType_WaterLevel, faceStates[1].waterLevel);
+      replaceOrEnqueueCommOnFace(1, CommandType_WaterLevel, faceStates[1].waterLevel, true);
     }
     if (tryFlowWater(&faceStates[5].waterLevel, &faceStates[4].waterLevel, &faceStates[4].waterLevelNew, MAX_WATER_LEVEL) > 0)
     {
-      replaceOrEnqueueCommOnFace(5, CommandType_WaterLevel, faceStates[5].waterLevel);
+      replaceOrEnqueueCommOnFace(5, CommandType_WaterLevel, faceStates[5].waterLevel, true);
     }
 
     // FLOW TO SIDES
@@ -687,13 +916,13 @@ void waterFlowToSides(char srcPixel, byte *dst1, byte *dst1New, byte *dst2, byte
 {
   if (tryFlowWater(&faceStates[srcPixel].waterLevel, dst1, dst1New, faceStates[srcPixel].waterLevel >> 1) > 0)
   {
-    replaceOrEnqueueCommOnFace(srcPixel, CommandType_WaterLevel, faceStates[srcPixel].waterLevel);
+    replaceOrEnqueueCommOnFace(srcPixel, CommandType_WaterLevel, faceStates[srcPixel].waterLevel, true);
   }
   if (dst2 != null)
   {
     if (tryFlowWater(&faceStates[srcPixel].waterLevel, dst2, dst2New, faceStates[srcPixel].waterLevel >> 1) > 0)
     {
-      replaceOrEnqueueCommOnFace(srcPixel, CommandType_WaterLevel, faceStates[srcPixel].waterLevel);
+      replaceOrEnqueueCommOnFace(srcPixel, CommandType_WaterLevel, faceStates[srcPixel].waterLevel, true);
     }
   }
 }
@@ -704,6 +933,7 @@ void waterFlowToSides(char srcPixel, byte *dst1, byte *dst1New, byte *dst2, byte
 //
 // =================================================================================================
 
+#if INCLUDE_SPECIAL_TILES
 void loopDirt()
 {
   // Once saturated, dirt tiles will seep water
@@ -731,7 +961,24 @@ void loopDirt()
       byte waterLevel = getDirtWaterLevelToSend();
       FOREACH_FACE(f)
       {
-        replaceOrEnqueueCommOnFace(f, CommandType_WaterLevel, waterLevel);
+        replaceOrEnqueueCommOnFace(f, CommandType_WaterLevel, waterLevel, true);
+      }
+    }
+  }
+
+  if (energyDistTimer.isExpired())
+  {
+    byte energyToDistributePerFace = 3;
+    if (dirtReservoir >= (FACE_COUNT * energyToDistributePerFace))
+    {
+      // Calculate how much energy to distribute
+      // Using an amazing formula of 1 water = 1 energy
+      dirtReservoir -= energyToDistributePerFace * FACE_COUNT;
+      
+      FOREACH_FACE(f)
+      {
+        // Try to distribute energy to make a plant grow
+        enqueueCommOnFace(f, CommandType_DistEnergy, energyToDistributePerFace, true);
       }
     }
   }
@@ -760,15 +1007,142 @@ byte getDirtWaterLevelToSend()
 
   return waterLevel;
 }
+#endif
+
+void loopPlant()
+{
+  // Plants use energy periodically to stay alive and grow
+  if (energyUseTimer.isExpired())
+  {
+    //
+    // Maintain grown branches first (energy use = 1 per branch)
+    //
+    for (int branchIndex = 0; branchIndex < 3; branchIndex++)
+    {
+      if (plantState.branches[branchIndex].state != kBranchState_Empty)
+      {
+        if (plantState.energyTotal > 0)
+        {
+          // There is enough energy to maintain this branch - replenish it and deduct the energy
+          plantState.branches[branchIndex].growthEnergy = 3;
+          plantState.energyTotal--;
+        }
+        else
+        {
+          // Not enough energy to maintain this branch - it is dying
+          if (plantState.branches[branchIndex].growthEnergy > 0)
+          {
+            plantState.branches[branchIndex].growthEnergy--;
+          }
+          else
+          {
+            // No more growth energy - this branch is dead
+            plantState.branches[branchIndex].state = kBranchState_Empty;
+          }
+        }
+      }
+    }
+
+    // Maintain growing branches next (energy use = growth state per branch)
+    for (int branchIndex = 0; branchIndex < 3; branchIndex++)
+    {
+      if (plantState.branches[branchIndex].state == kBranchState_Empty &&
+          plantState.branches[branchIndex].growthEnergy > 0)
+      {
+        if (plantState.energyTotal >= plantState.branches[branchIndex].growthEnergy)
+        {
+          // There is enough energy to maintain this growth - deduct the energy
+          plantState.energyTotal -= plantState.branches[branchIndex].growthEnergy;
+        }
+        else
+        {
+          // Not enough energy to maintain this branch - take a step back
+          plantState.branches[branchIndex].growthEnergy--;
+        }
+      }
+    }
+
+    // Remaining energy goes into trying to grow new branches
+    for (int branchIndex = 0; branchIndex < 3; branchIndex++)
+    {
+      if (plantState.branches[branchIndex].state == kBranchState_Empty)
+      {
+        // Growing requires energy of current level+1
+        if (plantState.energyTotal > plantState.branches[branchIndex].growthEnergy)
+        {
+          plantState.energyTotal -= plantState.branches[branchIndex].growthEnergy + 1;
+          plantState.branches[branchIndex].growthEnergy++;
+        }
+
+        // Once reach max growth level, sprout a leaf!
+        if (plantState.branches[branchIndex].growthEnergy == 3)
+        {
+          plantState.branches[branchIndex].state = kBranchState_Leaf;
+        }
+
+        // If the root branch is still growing, don't process the other branches
+        if (branchIndex == 0)
+        {
+          break;
+        }
+      }
+    }
+
+    energyUseTimer.set(ENERGY_USE_RATE);
+  }
+
+  // Distribute excess energy along grown branches
+  if (energyDistTimer.isExpired())
+  {
+    // Send excess energy along grown branches
+    // Always keep 3 energy to maintain our branches
+    if (plantState.branches[1].state != kBranchState_Empty &&
+        plantState.branches[2].state != kBranchState_Empty &&
+        plantState.energyTotal > 3)
+    {
+      byte energyToSend = (plantState.energyTotal - 3) >> 1;
+      energyToSend = MIN(energyToSend, 15); // clamp to max value we can send
+
+      if (energyToSend > 0)
+      {
+        // Skip root branch (index 0)
+        for (int branchIndex = 1; branchIndex < 3; branchIndex++)
+        {
+          // Branch is either 2 or 4 faces away from the root
+          byte leafFace = CCW_FROM_FACE(plantState.rootFace, 2 * branchIndex);
+          enqueueCommOnFace(leafFace, CommandType_DistEnergy, energyToSend, true);
+        }
+      
+        plantState.energyTotal -= energyToSend << 1;
+      }
+    }
+  }
+
+}
+
 // =================================================================================================
 //
 // SUN
 //
 // =================================================================================================
 
+#if INCLUDE_SPECIAL_TILES
 void loopSun()
 {
+  if (generateSunTimer.isExpired())
+  {
+    // Send out sunlight rays in all directions, three hexes wide
+    FOREACH_FACE(f)
+    {
+      enqueueCommOnFace(f, CommandType_SendSun,     SUN_STRENGTH, true);
+      enqueueCommOnFace(f, CommandType_SendSunCW,   SUN_STRENGTH, true);
+      enqueueCommOnFace(f, CommandType_SendSunCCW,  SUN_STRENGTH, true);
+    }
+
+    generateSunTimer.set(GENERATE_SUN_RATE);
+  }
 }
+#endif
 
 // =================================================================================================
 //
@@ -787,7 +1161,8 @@ void render()
       // already set tiles to black - don't need to do anything else
       //setColorOnFace(dim(WHITE, 64), 1);
       break;
-      
+
+#if INCLUDE_SPECIAL_TILES
     case kTileState_Dripper:
       // Intensity rises as it gets closer to dripping
       {
@@ -805,12 +1180,14 @@ void render()
     case kTileState_Dirt:
       {
         setColor(COLOR_DIRT);
+#ifdef DEBUG_COLORS
         if (dirtReservoir >= MAX_DIRT_WATER)
         {
           setColorOnFace(COLOR_DIRT_FULL, 2);
           setColorOnFace(COLOR_DIRT_FULL, 3);
           setColorOnFace(COLOR_DIRT_FULL, 4);
         }
+#endif
       }
       break;
 
@@ -826,22 +1203,91 @@ void render()
         setColor(dim(COLOR_SUN, dimness));
       }
       break;
+#endif
   }
 
   if (tileState == kTileState_Empty)
   {
     FOREACH_FACE(f)
     {
+      // Water in the background
       if (faceStates[f].waterLevel > 0)
       {
         byte dimness = faceStates[f].waterLevel << 4;    // water level 1 = brightness 16
         Color waterColor = dim(COLOR_WATER, dimness);
+#ifdef DEBUG_COLORS
         if (faceStates[f].waterLevel >= MAX_WATER_LEVEL)
         {
           // Special case for full water just so we can see it
           waterColor = COLOR_WATER_FULL;
+          if (faceStates[f].waterLevel >= (MAX_WATER_LEVEL+1))
+          {
+            waterColor = COLOR_WATER_FULL1;
+            if (faceStates[f].waterLevel >= (MAX_WATER_LEVEL+2))
+            {
+              waterColor = COLOR_WATER_FULL2;
+              if (faceStates[f].waterLevel >= (MAX_WATER_LEVEL+3))
+              {
+                waterColor = COLOR_WATER_FULL3;
+                if (faceStates[f].waterLevel >= (MAX_WATER_LEVEL+4))
+                {
+                  waterColor = COLOR_WATER_FULL4;
+                  if (faceStates[f].waterLevel >= (MAX_WATER_LEVEL+5))
+                  {
+                    waterColor = COLOR_WATER_FULL5;
+                    if (faceStates[f].waterLevel >= (MAX_WATER_LEVEL+6))
+                    {
+                      waterColor = COLOR_WATER_FULL6;
+                      if (faceStates[f].waterLevel >= (MAX_WATER_LEVEL+7))
+                      {
+                        waterColor = COLOR_WATER_FULL7;
+                        if (faceStates[f].waterLevel >= (MAX_WATER_LEVEL+8))
+                        {
+                          waterColor = COLOR_WATER_FULL8;
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
         }
+#endif
         setColorOnFace(waterColor, f);
+      }
+
+      // Plant in the foreground
+      for (int branchIndex = 0; branchIndex < 3; branchIndex++)
+      {
+        byte leafFace = CCW_FROM_FACE(plantState.rootFace, 2 * branchIndex);
+        switch (plantState.branches[branchIndex].state)
+        {
+#ifdef DEBUG_COLORS
+          case kBranchState_Empty:
+          {
+            if (plantState.branches[branchIndex].growthEnergy == 1)
+            {
+              setColorOnFace(COLOR_PLANT_GROWTH1, leafFace);
+            }
+            else if (plantState.branches[branchIndex].growthEnergy == 2)
+            {
+              setColorOnFace(COLOR_PLANT_GROWTH2, leafFace);
+            }
+            else if (plantState.branches[branchIndex].growthEnergy == 3)
+            {
+              setColorOnFace(COLOR_PLANT_GROWTH3, leafFace);
+            }
+          }
+          break;
+#endif
+          
+          case kBranchState_Leaf:
+          {
+            setColorOnFace(COLOR_PLANT, leafFace);
+          }
+          break;
+        }
       }
     }
   }
@@ -879,9 +1325,13 @@ void render()
       {
         setColorOnFace(ORANGE, f);
       }
-      else
+      else if (commInsertionIndexes[f] == COMM_DATA_OVERRUN)
       {
         setColorOnFace(RED, f);
+      }
+      else
+      {
+        setColorOnFace(GREEN, f);
       }
     }
     else if (!isValueReceivedOnFaceExpired(f))
