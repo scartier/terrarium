@@ -1,30 +1,33 @@
-// DID
-// * Sun?
-// * Refactored water flow to save code space (~330 bytes)
-// * Found max data (942 bytes) - Have > 140 bytes left
-// * Bitwise structs eat into code space! Found by creating a memclr instead of setting all plant values to 0. Saved 300 bytes.
-// * Got a comm overrun. Changed how plants gather sunlight to not overuse the comms.
+// DONE
+// * Gravity tile
+// * Allow arbitrary tile rotations (OMG)
+// * Asymmetric tiles
+// * Button presses change special tile rate
+// * Multi-click reset tile
+// * Double click change special tile
 
 // TODO
 // * Change sense of neighbor water level to be how much it can accept
-// * Toggle debug info with triple click
+// * Change plant leaves to branches as it grows
 
 // WHEN HAVE MORE TILES
 // * Ensure sunlight is absorbed/blocked by things correctly
 
 #define null 0
-//#define DEBUG_COMMS 1
-//#define DEBUG_COLORS 1
-#define NEW_WATER_CODE 1
-#define INCLUDE_BASE_TILES    1
-#define INCLUDE_SPECIAL_TILES 1
 
-#define COLOR_DRIPPER     makeColorRGB(  0, 255, 128)
+#define INCLUDE_BASE_TILES    1
+#define INCLUDE_SPECIAL_TILES 0
+
+#define DEBUG_COMMS 0
+#define DEBUG_COLORS 0
+#define USE_DATA_SPONGE 0
+
+#define COLOR_DRIPPER_HUE 106 // RGB=0,255,128
 #define COLOR_DIRT        makeColorRGB(107,  80,   0)
 #if DEBUG_COLORS
 #define COLOR_DIRT_FULL   makeColorRGB(107,  80,  32)
 #endif
-#define COLOR_SUN         makeColorRGB(255, 255,   0)
+#define COLOR_SUN_HUE     42 // RGB=255,255,0
 #define COLOR_BUG         makeColorRGB(107,  80,   0)
 #define COLOR_WATER       makeColorRGB(  0,   0, 128)
 
@@ -61,8 +64,7 @@
 #define CCW_FROM_FACE(f, amt) (((f) - (amt)) + (((f) >= (amt)) ? 0 : 6))
 
 // Gravity is a constant velocity for now (not accelerative)
-// Might change that later if there's need
-#define GRAVITY 300 // ms to fall from pixel to pixel
+#define GRAVITY 200 // ms to fall from pixel to pixel
 Timer gravityTimer;
 
 enum eTileFlags
@@ -74,7 +76,6 @@ byte tileFlags;
 unsigned long currentTime = 0;
 byte frameTime;
 
-#define USE_DATA_SPONGE 0
 #if USE_DATA_SPONGE
 byte sponge[143];
 #endif
@@ -85,20 +86,32 @@ byte sponge[143];
 //
 // =================================================================================================
 
-// States the player can select for a tile
-// They cycle through by clicking the tile's button
-enum eTileState
+// Roles the player can select for a tile
+enum eTileRole
 {
-  kTileState_Empty,
-  kTileState_Dripper,
-  kTileState_Dirt,
-  kTileState_Sun,
+  kTileRole_Base,
+  
+  kTileRole_Dripper,
+  kTileRole_Dirt,
+  kTileRole_Sun,
+  kTileRole_Gravity,
 
-  kTileState_MAX
+  kTileRole_MAX
 };
 
 // Current tile state - starts empty
-char tileState = kTileState_Empty;
+#if INCLUDE_BASE_TILES
+char tileRole = kTileRole_Base;
+#else
+char tileRole = kTileRole_Dirt;
+#endif
+
+#define GRAVITY_UP_FACE_UNKNOWN -1
+char gravityUpFace = GRAVITY_UP_FACE_UNKNOWN;
+
+#define SUN_SEEN_RATE 500
+char sunSeen;
+Timer sunSeenTimer;
 
 // -------------------------------------------------------------------------------------------------
 // DRIPPER/WATER
@@ -109,16 +122,27 @@ char tileState = kTileState_Empty;
 #define DRIPPER_AMOUNT 4
 #define DRIPPER_RATE 1000   // ms between drips
 Timer dripperTimer;
+byte dripperSpeedScale = 0;
 #endif
 
+#if INCLUDE_SPECIAL_TILES
 #define DIRT_EVAPORATION 4
+#endif
+
+// Normal tiles and dirt tiles both evaporate water
 #define EVAPORATION_RATE 5000
 Timer evaporationTimer;
 
 // -------------------------------------------------------------------------------------------------
 // DIRT/PLANT
 //
+#if INCLUDE_SPECIAL_TILES
 #define MAX_DIRT_RESERVOIR 100
+#endif
+
+// Most gathered sunlight a tile can hold
+// The practical max will be a lot lower than this because leaves only collect 1 unit at a time
+// Used by both normal tiles (plants) and dirt tiles
 #define MAX_GATHERED_SUN 200
 
 #if INCLUDE_SPECIAL_TILES
@@ -130,12 +154,16 @@ byte gatheredSun = 0;   // used by plants (dirt tiles use the per-face 'gathered
 #endif
 
 // Amount of water that seeps out of a saturated dirt tile
+#if INCLUDE_SPECIAL_TILES
 #define DIRT_WATER_SEEP 4
+#endif
 
-// Controls the rate at which the dirt distributes energy to its plants
-// Also used by leaves/branches to continue distributing energy up the plant
-#define ENERGY_DIST_RATE 5000
-Timer energyDistTimer;
+// Used with plants. This is the rate that...
+// ...collected sun is transmitted down the plant to the dirt
+// ...dirt tiles distributes energy up to its plants
+// ...plants distribute excess energy upwards to continue growth
+#define PLANT_ENERGY_RATE 5000
+Timer plantEnergyTimer;
 
 #define MAX_ENERGY_PER_TILE 24
 enum eBranchState
@@ -159,12 +187,6 @@ struct PlantState
 };
 PlantState plantState;
 
-#if INCLUDE_BASE_TILES
-// Controls the rate at which plants use energy to stay alive and grow
-#define ENERGY_USE_RATE 5000
-Timer energyUseTimer;
-#endif
-
 // -------------------------------------------------------------------------------------------------
 // SUN
 //
@@ -173,12 +195,22 @@ Timer energyUseTimer;
 #define SUN_STRENGTH 3
 #define GENERATE_SUN_RATE 500
 Timer generateSunTimer;
+byte sunStrengthScale = 1;
 #endif
 
 //#if DEBUG_COLORS
 #define SUN_PULSE_RATE 250
 Timer sunPulseTimer;
 //#endif
+
+// -------------------------------------------------------------------------------------------------
+// GRAVITY
+//
+// This timer is used by gravity tiles to broadcast the gravity direction
+// It is also used by normal tiles to know not to accept any new gravity for a while
+#define SEND_GRAVITY_RATE 5000
+#define CHECK_GRAVITY_RATE (SEND_GRAVITY_RATE-1000)
+Timer sendGravityTimer;
 
 // =================================================================================================
 //
@@ -209,7 +241,6 @@ struct FaceState
   FaceValue faceValueIn;
   FaceValue faceValueOut;
   byte lastCommandIn;
-
   byte neighborSyncFlags;
   
   byte waterLevel;
@@ -221,7 +252,7 @@ struct FaceState
   byte gatheredSun;           // so dirt tiles send energy to the right face
 #endif
 
-  byte faceColor; // DEBUG
+//  byte faceColor; // DEBUG
 
 #if DEBUG_COMMS
   byte ourState;
@@ -237,13 +268,14 @@ FaceState faceStates[FACE_COUNT];
 enum CommandType
 {
   CommandType_None,         // no data
-  CommandType_WaterLevel,   // Tell Our Water Level : value=water level on this face
+  CommandType_WaterLevel,   // Our current water level
   CommandType_WaterAdd,     // Add Water To Neighbor : value=water level to add to the neighbor face
   CommandType_DistEnergy,   // Distribute Energy : value=energy
   CommandType_SendSun,      // Send sunlight (sent from Sun tiles): value=sun amount
   CommandType_SendSunCW,    // Send sunlight (sent from Sun tiles): value=sun amount (turns CW after one tile)
   CommandType_SendSunCCW,   // Send sunlight (sent from Sun tiles): value=sun amount (turns CCW after one tile)
   CommandType_GatherSun,    // Gather sun from leaves to root : value=sun amount
+  CommandType_GravityDir,   // Tell neighbor which way gravity points - propagates out from gravity tile
 #if DEBUG_COMMS
   CommandType_UpdateState,
 #endif
@@ -257,7 +289,7 @@ struct CommandAndData
   byte data : 4;
 };
 
-#define COMM_QUEUE_SIZE 8
+#define COMM_QUEUE_SIZE 4
 CommandAndData commQueues[FACE_COUNT][COMM_QUEUE_SIZE];
 
 #define COMM_INDEX_ERROR_OVERRUN 0xFF
@@ -364,6 +396,34 @@ void enqueueCommOnFace(byte f, CommandType commandType, byte data, bool clampToM
   commInsertionIndexes[f]++;
 }
 
+// Replace the data for the given command in the queue, if it exists.
+// Otherwise add it to the queue.
+void replaceOrEnqueueCommOnFace(byte f, CommandType commandType, byte data, bool clampToMax)
+{
+  for (byte index = 0; index < commInsertionIndexes[f]; index++)
+  {
+    if (commQueues[f][index].command == commandType)
+    {
+      if (data & 0xF0)
+      {
+        if (clampToMax)
+        {
+          data = 0xF;
+        }
+        else
+        {
+          commInsertionIndexes[f] = COMM_DATA_OVERRUN;
+        }
+      }
+
+      commQueues[f][index].data = data;
+      return;
+    }
+  }
+
+  enqueueCommOnFace(f, commandType, data, clampToMax);
+}
+
 // Called every iteration of loop(), preferably before any main processing
 // so that we can act on any new data being sent.
 void updateCommOnFaces()
@@ -413,151 +473,8 @@ void updateCommOnFaces()
       else
       {
         // This is the second part of a comm (DATA)
-        // Use the saved command value to determine what to do with the data
-        switch (faceState->lastCommandIn)
-        {
-          case CommandType_WaterLevel:
-            faceState->waterLevelNeighbor = value;
-            faceState->neighborSyncFlags |= NeighborSyncFlag_GotWater;
-            break;
-            
-          case CommandType_WaterAdd:
-            switch (tileState)
-            {
-              case kTileState_Empty:
-                // Normal tiles accumulate water in each face
-                faceState->waterLevel += value;
-                replaceOrEnqueueCommOnFace(f, CommandType_WaterLevel, faceState->waterLevel, true);
-                break;
-
-#if INCLUDE_SPECIAL_TILES
-              case kTileState_Dirt:
-                // Dirt tiles have one large reservoir absorbed in the tile
-                dirtReservoir += value;
-                replaceOrEnqueueCommOnFace(f, CommandType_WaterLevel, getDirtWaterLevelToSend(), true);
-                break;
-#endif
-            }
-            break;
-            
-          case CommandType_DistEnergy:
-            if (tileState == kTileState_Empty)
-            {
-              // Can only accept the energy if there is no plant growing here, or if
-              // the energy is coming from the same root.
-              if (plantState.branches[0].state == kBranchState_Empty || plantState.rootFace == f)
-              {
-                // Clamp to max amount we can store
-                if ((MAX_ENERGY_PER_TILE - plantState.energyTotal) < value)
-                {
-                  plantState.energyTotal = MAX_ENERGY_PER_TILE;
-                }
-                else
-                {
-                  plantState.energyTotal += value;
-                }
-                plantState.rootFace = f;
-              }
-            }
-            break;
-
-          case CommandType_SendSun:
-          case CommandType_SendSunCW:
-          case CommandType_SendSunCCW:
-            if (tileState == kTileState_Empty)
-            {
-              tileFlags |= kTileFlag_PulseSun;
-              
-              // Plant leaves absorb sunlight
-              // Send on the rest in the same direction
-              for (int branchIndex = 0; branchIndex < 3; branchIndex++)
-              {
-                if (value == 0)
-                {
-                  break;    // break out once there's no more sun
-                }
-                if (plantState.branches[branchIndex].state == kBranchState_Leaf)
-                {
-                  // Leaves absorb the sun
-                  plantState.branches[branchIndex].didGatherSun = 1;
-                  value--;
-                }
-                else if (plantState.branches[branchIndex].state == kBranchState_Branch)
-                {
-                  // Branches just block the sun
-                  value--;
-                }
-              }
-            }
-#if INCLUDE_SPECIAL_TILES
-            else if (tileState == kTileState_Dirt)
-            {
-              // Dirt blocks all sunlight
-              value = 0;
-            }
-            // Note: Drippers and sun tiles do not block sunlight
-#endif
-
-            // Any remaining sun gets sent on
-            if (value > 0)
-            {
-              byte faceOffset = 3;  // typically we want the opposite face
-              if (faceState->lastCommandIn == CommandType_SendSunCW)
-              {
-                faceOffset = 2;   // special case when sent out of a sun tile to make sunshine 3 hexes wide
-              }
-              else if (faceState->lastCommandIn == CommandType_SendSunCCW)
-              {
-                faceOffset = 4;   // special case when sent out of a sun tile to make sunshine 3 hexes wide
-              }
-              byte exitFace = CCW_FROM_FACE(f, faceOffset);
-              enqueueCommOnFace(exitFace, CommandType_SendSun, value, true);
-            }
-            break;
-            
-          case CommandType_GatherSun:
-            if (tileState == kTileState_Empty)
-            {
-              // Plants propagate the sun until it gets to the root in the dirt
-              if (plantState.branches[0].state != kBranchState_Empty)
-              {
-                if (gatheredSun < MAX_GATHERED_SUN)
-                {
-                  gatheredSun += value;
-                }
-
-/*
-                // When receiving sun, convert our leaves to branches
-                char faceOffsetFromRoot = plantState.rootFace - f;
-                if (faceOffsetFromRoot == 2 || faceOffsetFromRoot == -4)
-                {
-                  plantState.branches[1].state = kBranchState_Branch;
-                }
-                else if (faceOffsetFromRoot == 4 || faceOffsetFromRoot == -2)
-                {
-                  plantState.branches[2].state = kBranchState_Branch;
-                }
-*/
-              }
-            }
-#if INCLUDE_SPECIAL_TILES
-            else if (tileState == kTileState_Dirt)
-            {
-              // Dirt tiles convert sun to energy!
-              if (faceState->gatheredSun < MAX_GATHERED_SUN)
-              {
-                faceState->gatheredSun += value;
-              }
-            }
-#endif
-            break;
-          
-#if DEBUG_COMMS
-          case CommandType_UpdateState:
-            faceState->ourState = value;
-            break;
-#endif
-        }
+        // Do application-specific stuff with the comm
+        processCommForFace(faceState->lastCommandIn, value, f);
       }
 
       // Acknowledge that we processed this value so the neighbor can send the next one
@@ -638,12 +555,10 @@ void loop()
 {
   // Clamp frame time at 250 ms to fit within a byte
   // Hopefully processing doesn't ever take longer than that for one frame
-  /*
   unsigned long previousTime = currentTime;
   currentTime = millis();
   unsigned long timeSinceLastLoop = currentTime - previousTime;
   frameTime = (timeSinceLastLoop > 250) ? 250 : 0;
-  */
   
   // User input
   updateUserSelection();
@@ -662,28 +577,30 @@ void loop()
     }
     sendNewStateTimer.set(500);
   }
-#else
+#else // DEBUG_COMMS
 
   // Systems updates
-  switch (tileState)
+  switch (tileRole)
   {
 #if INCLUDE_BASE_TILES
-    case kTileState_Empty:
+    case kTileRole_Base:
       loopWater();
       loopPlant();
       break;
 #endif
       
 #if INCLUDE_SPECIAL_TILES
-    case kTileState_Dripper:  loopDripper();  break;
-    case kTileState_Dirt:     loopDirt();     break;
-    case kTileState_Sun:      loopSun();      break;
+    case kTileRole_Dripper:  loopDripper();  break;
+    case kTileRole_Dirt:     loopDirt();     break;
+    case kTileRole_Sun:      loopSun();      break;
+    case kTileRole_Gravity:  loopGravity();  break;
 #endif
   }  
 
   // Update water levels and such
   postProcessState();
-#endif
+  
+#endif // DEBUG_COMMS
 
   // Set the colors on all faces according to what's happening in the tile
   render();
@@ -698,49 +615,97 @@ void loop()
 
 void updateUserSelection()
 {
-  if (buttonDoubleClicked())
+  // Dirt tiles get reset too
+  if (buttonMultiClicked())
   {
     // Reset our state and tell our neighbors to reset their perception of us
     resetOurState();
   }
 
 #if INCLUDE_SPECIAL_TILES
-  if (buttonSingleClicked())
+  if (buttonDoubleClicked())
   {
     // User state changed
 
-    char prevTileState = tileState;
+    char prevTileState = tileRole;
     
-    tileState++;
-    if (tileState >= kTileState_MAX)
+    tileRole++;
+    if (tileRole >= kTileRole_MAX)
     {
-      tileState = 0;
+#if INCLUDE_BASE_TILES
+      tileRole = kTileRole_Base;
+#else
+      tileRole = kTileRole_Dripper;
+#endif
     }
 
     // Reset our state and tell our neighbors to reset their perception of us
     resetOurState();
 
-    if (prevTileState != tileState)
+    if (prevTileState != tileRole)
     {
       switch (prevTileState)
       {
-        case kTileState_Dripper:
+        case kTileRole_Dripper:
           break;
       }
 
-      switch (tileState)
+      switch (tileRole)
       {
-        case kTileState_Dripper:
-          dripperTimer.set(DRIPPER_RATE);   // start dripping
+        case kTileRole_Dripper:
+          dripperTimer.set(DRIPPER_RATE >> dripperSpeedScale);   // start dripping
           break;
 
-        case kTileState_Dirt:
-          energyDistTimer.set(ENERGY_DIST_RATE);
+        case kTileRole_Dirt:
+          plantEnergyTimer.set(PLANT_ENERGY_RATE);
           break;
       }
     }
-  }  // buttonSingleClicked
+  }  // buttonDoubleClicked
 #endif
+
+  if (buttonSingleClicked())
+  {
+#if INCLUDE_SPECIAL_TILES
+    switch (tileRole)
+    {
+      case kTileRole_Dripper:
+        dripperSpeedScale++;
+        if (dripperSpeedScale > 2)
+        {
+          dripperSpeedScale = 0;
+        }
+        break;
+        
+      case kTileRole_Sun:
+        sunStrengthScale++;
+        if (sunStrengthScale > 3)
+        {
+          sunStrengthScale = 1;
+        }
+        break;
+
+      case kTileRole_Gravity:
+        gravityUpFace++;
+        if (gravityUpFace >= FACE_COUNT)
+        {
+          gravityUpFace = 0;
+        }
+        sendGravityTimer.set(1);
+        break;
+    }
+#endif
+  }
+}
+
+void memclr(byte *ptr, byte len)
+{
+  byte *ptrEnd = ptr + len;
+  while (ptr != ptrEnd)
+  {
+    *ptr = 0;
+    ptr++;
+  }
 }
 
 void resetOurState()
@@ -752,13 +717,15 @@ void resetOurState()
     // Clear sync flags dealing with our state
     faceState->neighborSyncFlags &= ~NeighborSyncFlag_SentWater;
 
-    switch (tileState)
+    switch (tileRole)
     {
-      case kTileState_Empty:
+      case kTileRole_Base:
         faceState->waterLevel = 0;
         faceState->waterLevelNew = 0;
 
 #if 1
+        memclr((byte*) &plantState, sizeof(plantState));
+/*
         byte *ptr = (byte*) &plantState;
         byte *ptrEnd = (byte*) &plantState + sizeof(plantState);
         while (ptr != ptrEnd)
@@ -766,6 +733,7 @@ void resetOurState()
           *ptr = 0;
           ptr++;
         }
+        */
 #else
         plantState.branches[0].state = kBranchState_Empty;
         plantState.branches[1].state = kBranchState_Empty;
@@ -778,17 +746,17 @@ void resetOurState()
         break;
 
 #if INCLUDE_SPECIAL_TILES
-      case kTileState_Dripper:
+      case kTileRole_Dripper:
         dripperTimer.set(1);
         break;
         
-      case kTileState_Dirt:
+      case kTileRole_Dirt:
         faceState->waterLevel = MAX_WATER_LEVEL;
         faceState->gatheredSun = 0;
         dirtReservoir = 0;
         break;
 
-      case kTileState_Sun:
+      case kTileRole_Sun:
         generateSunTimer.set(1);
         break;
 #endif
@@ -799,38 +767,194 @@ void resetOurState()
 #endif
   }
 
+#if INCLUDE_BASE_TILES
   // Remove all plant energy - causes all plants to die immediately
   plantState.energyTotal = 0;
+#endif
 
   tileFlags = 0;
 }
 
-// Replace the data for the given command in the queue, if it exists.
-// Otherwise add it to the queue.
-void replaceOrEnqueueCommOnFace(byte f, CommandType commandType, byte data, bool clampToMax)
+void processCommForFace(CommandType command, byte value, byte f)
 {
-  for (byte index = 0; index < commInsertionIndexes[f]; index++)
+  FaceState *faceState = &faceStates[f];
+
+  // Use the saved command value to determine what to do with the data
+  switch (command)
   {
-    if (commQueues[f][index].command == commandType)
-    {
-      if (data & 0xF0)
+    case CommandType_WaterLevel:
+      faceState->waterLevelNeighbor = value;
+      faceState->neighborSyncFlags |= NeighborSyncFlag_GotWater;
+      break;
+      
+    case CommandType_WaterAdd:
+      switch (tileRole)
       {
-        if (clampToMax)
+#if INCLUDE_BASE_TILES
+        case kTileRole_Base:
         {
-          data = 0xF;
+          // Normal tiles accumulate water in each face
+          faceState->waterLevel += value;
+          replaceOrEnqueueCommOnFace(f, CommandType_WaterLevel, faceState->waterLevel, true);
         }
-        else
+          break;
+#endif
+
+#if INCLUDE_SPECIAL_TILES
+        case kTileRole_Dirt:
+          // Dirt tiles have one large reservoir absorbed in the tile
+          dirtReservoir += value;
+          replaceOrEnqueueCommOnFace(f, CommandType_WaterLevel, getDirtWaterLevelToSend(), true);
+          break;
+#endif
+      }
+      break;
+      
+    case CommandType_DistEnergy:
+#if INCLUDE_BASE_TILES
+      if (tileRole == kTileRole_Base)
+      {
+        // Can only accept the energy if there is no plant growing here, or if
+        // the energy is coming from the same root.
+        if (plantState.branches[0].state == kBranchState_Empty || plantState.rootFace == f)
         {
-          commInsertionIndexes[f] = COMM_DATA_OVERRUN;
+          // Clamp to max amount we can store
+          if ((MAX_ENERGY_PER_TILE - plantState.energyTotal) < value)
+          {
+            plantState.energyTotal = MAX_ENERGY_PER_TILE;
+          }
+          else
+          {
+            plantState.energyTotal += value;
+          }
+          plantState.rootFace = f;
         }
       }
+#endif
+      break;
 
-      commQueues[f][index].data = data;
-      return;
-    }
+    case CommandType_SendSun:
+    case CommandType_SendSunCW:
+    case CommandType_SendSunCCW:
+      if (sunSeen < (255 - value))
+      {
+        sunSeen += value;
+      }
+#if INCLUDE_BASE_TILES
+      if (tileRole == kTileRole_Base)
+      {
+        tileFlags |= kTileFlag_PulseSun;
+        
+        // Plant leaves absorb sunlight
+        // Send on the rest in the same direction
+        for (int branchIndex = 0; branchIndex < 3; branchIndex++)
+        {
+          if (value == 0)
+          {
+            break;    // break out once there's no more sun
+          }
+          if (plantState.branches[branchIndex].state == kBranchState_Leaf)
+          {
+            // Leaves absorb the sun
+            plantState.branches[branchIndex].didGatherSun = 1;
+            value--;
+          }
+          else if (plantState.branches[branchIndex].state == kBranchState_Branch)
+          {
+            // Branches just block the sun
+            value--;
+          }
+        }
+      }
+#endif
+#if INCLUDE_SPECIAL_TILES
+      if (tileRole == kTileRole_Dirt)
+      {
+        // Dirt blocks all sunlight
+        value = 0;
+      }
+      // Note: Drippers and sun tiles do not block sunlight
+#endif
+
+      // Any remaining sun gets sent on
+      if (value > 0)
+      {
+        byte faceOffset = 3;  // typically we want the opposite face
+        if (faceState->lastCommandIn == CommandType_SendSunCW)
+        {
+          faceOffset = 2;   // special case when sent out of a sun tile to make sunshine 3 hexes wide
+        }
+        else if (faceState->lastCommandIn == CommandType_SendSunCCW)
+        {
+          faceOffset = 4;   // special case when sent out of a sun tile to make sunshine 3 hexes wide
+        }
+        byte exitFace = CCW_FROM_FACE(f, faceOffset);
+        enqueueCommOnFace(exitFace, CommandType_SendSun, value, true);
+      }
+      break;
+      
+    case CommandType_GatherSun:
+#if INCLUDE_BASE_TILES
+      if (tileRole == kTileRole_Base)
+      {
+        // Plants propagate the sun until it gets to the root in the dirt
+        if (plantState.branches[0].state != kBranchState_Empty)
+        {
+          if (gatheredSun < MAX_GATHERED_SUN)
+          {
+            gatheredSun += value;
+          }
+
+/*
+          // When receiving sun, convert our leaves to branches
+          char faceOffsetFromRoot = plantState.rootFace - f;
+          if (faceOffsetFromRoot == 2 || faceOffsetFromRoot == -4)
+          {
+            plantState.branches[1].state = kBranchState_Branch;
+          }
+          else if (faceOffsetFromRoot == 4 || faceOffsetFromRoot == -2)
+          {
+            plantState.branches[2].state = kBranchState_Branch;
+          }
+*/
+        }
+      }
+#endif
+      
+#if INCLUDE_SPECIAL_TILES
+      if (tileRole == kTileRole_Dirt)
+      {
+        // Dirt tiles convert sun to energy!
+        if (faceState->gatheredSun < MAX_GATHERED_SUN)
+        {
+          faceState->gatheredSun += value;
+        }
+      }
+#endif
+      break;
+
+    case CommandType_GravityDir:
+      if (tileRole != kTileRole_Gravity)
+      {
+        if (sendGravityTimer.isExpired())
+        {
+          // Value is the CCW offset from this face
+          gravityUpFace = CCW_FROM_FACE(f, value);
+  
+          // Propagate this on to our neighbors, except the one that just sent it
+          propagateGravityDir(f);
+  
+          sendGravityTimer.set(CHECK_GRAVITY_RATE);
+        }
+      }
+      break;
+    
+#if DEBUG_COMMS
+    case CommandType_UpdateState:
+      faceState->ourState = value;
+      break;
+#endif
   }
-
-  enqueueCommOnFace(f, commandType, data, clampToMax);
 }
 
 void postProcessState()
@@ -872,26 +996,31 @@ void postProcessState()
       if (!(faceState->neighborSyncFlags & NeighborSyncFlag_SentWater))
       {
         byte waterLevel = faceState->waterLevel;
-        switch (tileState)
+        switch (tileRole)
         {
-          case kTileState_Empty:
+          case kTileRole_Base:
             // Empty tile uses actual water level
             break;
 
 #if INCLUDE_SPECIAL_TILES
-          case kTileState_Dripper:
+          case kTileRole_Dripper:
             // Drippers cannot accept water - it just falls around them
             waterLevel = MAX_WATER_LEVEL;
             break;
 
-          case kTileState_Sun:
+          case kTileRole_Sun:
             // Suns destroy water that falls in - it is always empty
             waterLevel = 0;
             break;
             
-          case kTileState_Dirt:
+          case kTileRole_Dirt:
             // Dirt absorbs water over the entire tile
             waterLevel = getDirtWaterLevelToSend();
+            break;
+            
+          case kTileRole_Gravity:
+            // Drippers cannot accept water - it just falls around them
+            waterLevel = MAX_WATER_LEVEL;
             break;
 #endif
         }
@@ -904,21 +1033,32 @@ void postProcessState()
   // Water evaporation/seepage
   if (evaporationTimer.isExpired())
   {
-    switch (tileState)
+    switch (tileRole)
     {
-      case kTileState_Empty:
+#if INCLUDE_BASE_TILES
+      case kTileRole_Base:
+        byte amountToEvaporate = 1 + (sunSeen >> 1);
         FOREACH_FACE(f)
         {
           if (faceStates[f].waterLevel > 0)
           {
-            faceStates[f].waterLevel--;
+            if (faceStates[f].waterLevel > amountToEvaporate)
+            {
+              faceStates[f].waterLevel -= amountToEvaporate;
+            }
+            else
+            {
+              faceStates[f].waterLevel == 0;
+            }
+            
             replaceOrEnqueueCommOnFace(f, CommandType_WaterLevel, faceStates[f].waterLevel, true);
           }
         }
         break;
+#endif
 
 #if INCLUDE_SPECIAL_TILES
-      case kTileState_Dirt:
+      case kTileRole_Dirt:
         if (dirtReservoir > 0)
         {
           dirtReservoir = (dirtReservoir < DIRT_EVAPORATION) ? 0 : (dirtReservoir - DIRT_EVAPORATION);
@@ -934,13 +1074,7 @@ void postProcessState()
     
     evaporationTimer.set(EVAPORATION_RATE);
   }
-
-  // Used by both dirt tiles and plants, so must go here
-  if (energyDistTimer.isExpired())
-  {
-    energyDistTimer.set(ENERGY_DIST_RATE);
-  }
-
+  
   if (gravityTimer.isExpired())
   {
     gravityTimer.set(GRAVITY);
@@ -958,7 +1092,7 @@ void loopDripper()
 {
   if (dripperTimer.isExpired())
   {
-    dripperTimer.set(DRIPPER_RATE);
+    dripperTimer.set(DRIPPER_RATE >> dripperSpeedScale);
 
     // Send out water in all six directions, if there is room to accommodate
     FOREACH_FACE(f)
@@ -981,6 +1115,7 @@ void loopDripper()
 }
 #endif
 
+#if INCLUDE_BASE_TILES
 struct WaterFlowCommand
 {
   byte srcFace : 3;
@@ -1022,92 +1157,44 @@ void loopWater()
   // Make water fall/flow
   if (gravityTimer.isExpired())
   {
-#if NEW_WATER_CODE
+  // Water cannot flow until we know which way gravity points
+    if (gravityUpFace == GRAVITY_UP_FACE_UNKNOWN)
+    {
+      return;
+    }
+    
     for (int waterFlowIndex = 0; waterFlowIndex < 16; waterFlowIndex++)
     {
       WaterFlowCommand command = waterFlowSequence[waterFlowIndex];
 
-      FaceState *faceStateSrc = &faceStates[command.srcFace];
-      FaceState *faceStateDst = &faceStates[command.dstFace];
+      byte srcFace = command.srcFace;
+      byte dstFace = command.dstFace;
+
+      // Factor in gravity
+      // Faces increase CW around the tile - need the CCW value to offset
+      byte gravityCCWAmount = 6 - gravityUpFace;
+      srcFace = CCW_FROM_FACE(srcFace, gravityCCWAmount);
+      dstFace = CCW_FROM_FACE(dstFace, gravityCCWAmount);
+      
+      FaceState *faceStateSrc = &faceStates[srcFace];
+      FaceState *faceStateDst = &faceStates[dstFace];
       
       byte *dst = command.isNeighbor ? &faceStateDst->waterLevelNeighbor : &faceStateDst->waterLevel;
       byte *dstNew = command.isNeighbor ? &faceStateDst->waterLevelNeighborNew : &faceStateDst->waterLevelNew;
       byte amountToSend = faceStateSrc->waterLevel >> command.halfWater;
       amountToSend = MIN(amountToSend, MAX_WATER_LEVEL);
       
-      if (!command.isNeighbor || NeighborSynced(command.dstFace))
+      if (!command.isNeighbor || NeighborSynced(dstFace))
       {
         if (tryFlowWater(&faceStateSrc->waterLevel, dst, dstNew, amountToSend) > 0)
         {
-          replaceOrEnqueueCommOnFace(command.srcFace, CommandType_WaterLevel, faceStateSrc->waterLevel, true);
+          replaceOrEnqueueCommOnFace(srcFace, CommandType_WaterLevel, faceStateSrc->waterLevel, true);
         }
       }
     }
-
-#else // NEW_WATER_CODE
-
-    // Water falls straight down within a tile, if possible.
-    // If the neighbor below is full/blocked then flow to the sides.
-
-    // FALL DOWN
-    // Bottom row first (to make room for the top row)
-    if (NeighborSynced(3))
-    {
-      if (tryFlowWater(&faceStates[3].waterLevel, &faceStates[3].waterLevelNeighbor, &faceStates[3].waterLevelNeighborNew, MAX_WATER_LEVEL) > 0)
-      {
-        replaceOrEnqueueCommOnFace(3, CommandType_WaterLevel, faceStates[3].waterLevel, true);
-      }
-    }
-    // Top row last
-    if (tryFlowWater(&faceStates[0].waterLevel, &faceStates[3].waterLevel, &faceStates[3].waterLevelNew, MAX_WATER_LEVEL) > 0)
-    {
-      replaceOrEnqueueCommOnFace(0, CommandType_WaterLevel, faceStates[0].waterLevel, true);
-    }
-    if (tryFlowWater(&faceStates[1].waterLevel, &faceStates[2].waterLevel, &faceStates[2].waterLevelNew, MAX_WATER_LEVEL) > 0)
-    {
-      replaceOrEnqueueCommOnFace(1, CommandType_WaterLevel, faceStates[1].waterLevel, true);
-    }
-    if (tryFlowWater(&faceStates[5].waterLevel, &faceStates[4].waterLevel, &faceStates[4].waterLevelNew, MAX_WATER_LEVEL) > 0)
-    {
-      replaceOrEnqueueCommOnFace(5, CommandType_WaterLevel, faceStates[5].waterLevel, true);
-    }
-
-    // FLOW TO SIDES
-    waterFlowToSides(5,
-                     &faceStates[0].waterLevel,
-                     &faceStates[0].waterLevelNew,
-                     NeighborSynced(5) ? &faceStates[5].waterLevelNeighbor : null,
-                     &faceStates[5].waterLevelNeighborNew);
-    waterFlowToSides(4,
-                     &faceStates[3].waterLevel,
-                     &faceStates[3].waterLevelNew,
-                     NeighborSynced(4) ? &faceStates[4].waterLevelNeighbor : null,
-                     &faceStates[4].waterLevelNeighborNew);
-    waterFlowToSides(0,
-                     &faceStates[5].waterLevel,
-                     &faceStates[5].waterLevelNew,
-                     &faceStates[1].waterLevel,
-                     &faceStates[1].waterLevelNew);
-    waterFlowToSides(3,
-                     &faceStates[4].waterLevel,
-                     &faceStates[4].waterLevelNew,
-                     &faceStates[2].waterLevel,
-                     &faceStates[2].waterLevelNew);
-    waterFlowToSides(1,
-                     &faceStates[0].waterLevel,
-                     &faceStates[0].waterLevelNew,
-                     NeighborSynced(1) ? &faceStates[1].waterLevelNeighbor : null,
-                     &faceStates[1].waterLevelNeighborNew);
-    waterFlowToSides(2,
-                     &faceStates[3].waterLevel,
-                     &faceStates[3].waterLevelNew,
-                     NeighborSynced(2) ? &faceStates[2].waterLevelNeighbor : null,
-                     &faceStates[2].waterLevelNeighborNew);
-
-#endif    // NEW_WATER_CODE
-
   }
 }
+#endif
 
 byte tryFlowWater(byte *srcWaterLevel, byte *dst, byte *dstNew, byte amountToSend)
 {
@@ -1132,23 +1219,6 @@ byte tryFlowWater(byte *srcWaterLevel, byte *dst, byte *dstNew, byte amountToSen
 
   return waterAmount;
 }
-
-#if NEW_WATER_CODE == 0
-void waterFlowToSides(char srcPixel, byte *dst1, byte *dst1New, byte *dst2, byte *dst2New)
-{
-  if (tryFlowWater(&faceStates[srcPixel].waterLevel, dst1, dst1New, faceStates[srcPixel].waterLevel >> 1) > 0)
-  {
-    replaceOrEnqueueCommOnFace(srcPixel, CommandType_WaterLevel, faceStates[srcPixel].waterLevel, true);
-  }
-  if (dst2 != null)
-  {
-    if (tryFlowWater(&faceStates[srcPixel].waterLevel, dst2, dst2New, faceStates[srcPixel].waterLevel >> 1) > 0)
-    {
-      replaceOrEnqueueCommOnFace(srcPixel, CommandType_WaterLevel, faceStates[srcPixel].waterLevel, true);
-    }
-  }
-}
-#endif
 
 // =================================================================================================
 //
@@ -1191,7 +1261,7 @@ void loopDirt()
   }
 
   // Generate energy for plants!
-  if (energyDistTimer.isExpired())
+  if (plantEnergyTimer.isExpired())
   {
     FOREACH_FACE(f)
     {
@@ -1218,6 +1288,8 @@ void loopDirt()
         }
       }
     }
+    
+    plantEnergyTimer.set(PLANT_ENERGY_RATE);
   }
 }
 
@@ -1246,10 +1318,11 @@ byte getDirtWaterLevelToSend()
 }
 #endif
 
+#if INCLUDE_BASE_TILES
 void loopPlant()
 {
   // Plants use energy periodically to stay alive and grow
-  if (energyUseTimer.isExpired())
+  if (plantEnergyTimer.isExpired())
   {
     //
     // Maintain grown branches first (energy use = 1 per branch)
@@ -1337,12 +1410,6 @@ void loopPlant()
       }
     }
 
-    energyUseTimer.set(ENERGY_USE_RATE);
-  }
-
-  // Distribute excess energy along grown branches
-  if (energyDistTimer.isExpired())
-  {
     // Send excess energy along grown branches
     // Always keep 3 energy to maintain our branches
     if (plantState.branches[1].state != kBranchState_Empty &&
@@ -1386,9 +1453,11 @@ void loopPlant()
         gatheredSun = 0;
       }
     }
+    
+    plantEnergyTimer.set(PLANT_ENERGY_RATE);
   }
-
 }
+#endif
 
 // =================================================================================================
 //
@@ -1404,15 +1473,69 @@ void loopSun()
     // Send out sunlight rays in all directions, three hexes wide
     FOREACH_FACE(f)
     {
-      enqueueCommOnFace(f, CommandType_SendSun,     SUN_STRENGTH, true);
-      enqueueCommOnFace(f, CommandType_SendSunCW,   SUN_STRENGTH, true);
-      enqueueCommOnFace(f, CommandType_SendSunCCW,  SUN_STRENGTH, true);
+      enqueueCommOnFace(f, CommandType_SendSun,     SUN_STRENGTH * sunStrengthScale, true);
+      enqueueCommOnFace(f, CommandType_SendSunCW,   SUN_STRENGTH * sunStrengthScale, true);
+      enqueueCommOnFace(f, CommandType_SendSunCCW,  SUN_STRENGTH * sunStrengthScale, true);
     }
 
     generateSunTimer.set(GENERATE_SUN_RATE);
   }
 }
 #endif
+
+// =================================================================================================
+//
+// GRAVITY
+//
+// =================================================================================================
+
+#if INCLUDE_SPECIAL_TILES
+void loopGravity()
+{
+  // Initialize gravity to an arbitrary direction
+  if (gravityUpFace == GRAVITY_UP_FACE_UNKNOWN)
+  {
+    gravityUpFace = 0;
+    sendGravityTimer.set(1000);  // force to send soonish
+  }
+  
+  if (sendGravityTimer.isExpired())
+  {
+    // Tell neighbors how many faces away is "up".
+    // Since tiles can be oriented any arbitrary direction, this 
+    // information must be relative to the face that is sending it.
+    propagateGravityDir(99);
+
+    sendGravityTimer.set(SEND_GRAVITY_RATE);
+  }
+}
+#endif
+
+// Outside the INCLUDE_SPECIAL_TILES because normal tiles need to propagate gravity too
+void propagateGravityDir(byte exceptFace)
+{
+  // Start sending from our version of "up" to make things easier to iterate
+  char ccwFromUp = 3;
+  for (byte faceOffset = 0; faceOffset < FACE_COUNT; faceOffset++)
+  {
+    byte f = CCW_FROM_FACE(gravityUpFace, faceOffset);
+
+    if (NeighborSynced(f))
+    {
+      // Want a way to avoid sending back to the face that told us
+      if (f != exceptFace)
+      {
+        enqueueCommOnFace(f, CommandType_GravityDir, ccwFromUp, true);
+      }
+    }
+    
+    ccwFromUp--;
+    if (ccwFromUp < 0)
+    {
+      ccwFromUp = 5;
+    }
+  }
+}
 
 // =================================================================================================
 //
@@ -1425,31 +1548,42 @@ void render()
   setColor(OFF);
 
   // Show the base tile state first
-  switch(tileState)
+  switch(tileRole)
   {
-    case kTileState_Empty:
+    case kTileRole_Base:
       // already set tiles to black - don't need to do anything else
       //setColorOnFace(dim(WHITE, 64), 1);
       break;
 
 #if INCLUDE_SPECIAL_TILES
-    case kTileState_Dripper:
-      // Intensity rises as it gets closer to dripping
+    case kTileRole_Dripper:
       {
-        long dimnessL = (dripperTimer.getRemaining() << 8) / DRIPPER_RATE;
-        byte dimness = 255;
-        if (dimnessL < 256)
+        // Make a wave around the tile
+        // Cycle every 2 seconds (2048 ms)
+        // Brighter/faster as the dripper rate increases
+        unsigned long faceTimeDiff = 341; // 2048 / 6 = 341-ish
+        unsigned long timeForFace = currentTime << dripperSpeedScale;
+        byte baseBrightness = 64 * dripperSpeedScale;
+        FOREACH_FACE(f)
         {
-          dimness = 255 - dimnessL;
+          byte brightnessScale = ((timeForFace & 0x3FF) >> 2);
+          if (timeForFace & 0x400)
+          {
+            brightnessScale = 255 - brightnessScale;
+          }
+  
+          byte brightness = baseBrightness + (((255 - baseBrightness) * brightnessScale) >> 8);
+          
+          setColorOnFace(makeColorHSB(COLOR_DRIPPER_HUE, 255, brightness), f);
+          timeForFace += faceTimeDiff;
         }
-        dimness = dimness >> 1;
-        setColor(dim(COLOR_DRIPPER, dimness));
       }
       break;
 
-    case kTileState_Dirt:
+    case kTileRole_Dirt:
       {
         setColor(COLOR_DIRT);
+        /*
 #if DEBUG_COLORS
         if (dirtReservoir >= MAX_DIRT_WATER)
         {
@@ -1458,28 +1592,36 @@ void render()
           setColorOnFace(COLOR_DIRT_FULL, 4);
         }
 #endif
+*/
       }
       break;
 
-    case kTileState_Sun:
+    case kTileRole_Sun:
       {
-        byte dimness = currentTime >> 1; // pulse every 512 ms
-        if (currentTime & 0x200)
+        // Make sun pulse
+        // Cycle every 4 seconds (4096 ms)
+        // Brighter/faster as the sun rate increases
+        unsigned long timeForFace = currentTime << sunStrengthScale;
+        FOREACH_FACE(f)
         {
-          dimness = 255 - dimness;  // pulse up and down alternating
+          unsigned long brightness = ((timeForFace & 0x7FF) >> 3);
+          if (timeForFace & 0x800)
+          {
+            brightness = 255 - brightness;
+          }
+            
+          setColorOnFace(makeColorHSB(COLOR_SUN_HUE, 255, brightness), f);
         }
-        if (dimness < 192)
-        {
-          dimness = 192;
-        }
-        //dimness |= 0x80;  // force a minimum of brightness
-        setColor(dim(COLOR_SUN, dimness));
       }
+      break;
+
+    case kTileRole_Gravity:
+      setColorOnFace(WHITE, gravityUpFace);
       break;
 #endif
   }
 
-  if (tileState == kTileState_Empty)
+  if (tileRole == kTileRole_Base)
   {
     FOREACH_FACE(f)
     {
@@ -1494,7 +1636,7 @@ void render()
         }
   
         byte sunDim = sunPulseTimer.getRemaining() >> 2;
-        setColorOnFace(dim(COLOR_SUN, sunDim), f);
+        setColorOnFace(dim(makeColorHSB(COLOR_SUN_HUE, 255, 255), sunDim), f);
       }
 //#endif
 
@@ -1591,6 +1733,14 @@ void render()
     }
   }
 
+#if DEBUG_COLORS
+  // Debug to show gravity
+  if (gravityUpFace != GRAVITY_UP_FACE_UNKNOWN)
+  {
+    setColorOnFace(WHITE, gravityUpFace);
+  }
+#endif
+  
   // Error codes
   FOREACH_FACE(f)
   {
@@ -1604,12 +1754,14 @@ void render()
       setColorOnFace(makeColorRGB(255,0,0), f);
     }
 
+/*
     switch (faceStates[f].faceColor)
     {
       case 1: setColorOnFace(COLOR_DEBUG1, f); break;
       case 2: setColorOnFace(COLOR_DEBUG2, f); break;
       case 3: setColorOnFace(COLOR_DEBUG3, f); break;
     }
+*/
   }
 
 #if DEBUG_COMMS
@@ -1649,5 +1801,13 @@ void render()
     }
   }
 #endif
+
+  // Reset how much sun we have seen since the last reset
+  // Deal with this here because it affects how the tile renders
+  if (sunSeenTimer.isExpired())
+  {
+    sunSeen = 0;
+    sunSeenTimer.set(SUN_SEEN_RATE);
+  }
 
 }
