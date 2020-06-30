@@ -1,35 +1,42 @@
 // DONE
-// * Gravity tile
-// * Allow arbitrary tile rotations (OMG)
-// * Asymmetric tiles
-// * Button presses change special tile rate
-// * Multi-click reset tile
-// * Double click change special tile
+// * Change plant leaves to branches as it grows
+// * Timed main loop - 48 ms at start - 31 ms typical
+// * Merge gravity tile into dripper
+// * Learned removing repeated calls helps code size 5594 vs 5728 for five Timer.set calls
 
 // TODO
 // * Change sense of neighbor water level to be how much it can accept
-// * Change plant leaves to branches as it grows
+// * Require click before plant will grow
+// * Bring back the bug!
+// * Fix comm errors when waking from sleep
 
 // WHEN HAVE MORE TILES
 // * Ensure sunlight is absorbed/blocked by things correctly
 
 #define null 0
 
-#define INCLUDE_BASE_TILES    1
-#define INCLUDE_SPECIAL_TILES 0
+#define INCLUDE_BASE_TILES    0
+#define INCLUDE_SPECIAL_TILES 1
 
 #define DEBUG_COMMS 0
 #define DEBUG_COLORS 0
 #define USE_DATA_SPONGE 0
+#define NEW_RENDER 0
+#define NEW_DRIPPER_RENDER 1
 
-#define COLOR_DRIPPER_HUE 106 // RGB=0,255,128
-#define COLOR_DIRT        makeColorRGB(107,  80,   0)
-#if DEBUG_COLORS
-#define COLOR_DIRT_FULL   makeColorRGB(107,  80,  32)
-#endif
-#define COLOR_SUN_HUE     42 // RGB=255,255,0
-#define COLOR_BUG         makeColorRGB(107,  80,   0)
-#define COLOR_WATER       makeColorRGB(  0,   0, 128)
+#define HUE_DRIPPER      106
+#define HUE_DIRT          32
+#define HUE_SUN           42
+#define HUE_BUG           55
+#define HUE_WATER        171
+#define HUE_LEAF          85
+#define HUE_BRANCH        28
+#define HUE_FLOWER       233
+
+//#define COLOR_BUG       makeColorHSB(HUE_BUG,    255, 128)
+#define COLOR_LEAF      makeColorHSB(HUE_LEAF,   255, 128)
+#define COLOR_BRANCH    makeColorHSB(HUE_BRANCH, 255, 128)
+#define COLOR_WATER     makeColorHSB(HUE_WATER,  255, 128)
 
 #if DEBUG_COLORS
 #define COLOR_WATER_FULL  makeColorRGB(  0, 128, 128)
@@ -43,9 +50,6 @@
 #define COLOR_WATER_FULL8  makeColorRGB(  0, 0, 128)
 #define COLOR_WATER_FULL9  makeColorRGB(  0, 0, 255)
 #endif
-
-#define COLOR_LEAF         makeColorRGB(  0, 255,   0)
-#define COLOR_BRANCH       makeColorRGB(152, 102,   0)
 
 #if DEBUG_COLORS
 #define COLOR_PLANT_GROWTH1 makeColorRGB(  128, 0,  64)
@@ -61,6 +65,7 @@
 #define MIN(x,y) ((x) < (y) ? (x) : (y))
 
 #define OPPOSITE_FACE(f) (((f) < 3) ? ((f) + 3) : ((f) - 3))
+#define CW_FROM_FACE(f, amt) ((f + amt) % FACE_COUNT)
 #define CCW_FROM_FACE(f, amt) (((f) - (amt)) + (((f) >= (amt)) ? 0 : 6))
 
 // Gravity is a constant velocity for now (not accelerative)
@@ -70,11 +75,23 @@ Timer gravityTimer;
 enum eTileFlags
 {
   kTileFlag_PulseSun = 1<<0,
+  kTileFlag_HasBug = 1<<1,
 };
 byte tileFlags;
 
 unsigned long currentTime = 0;
 byte frameTime;
+byte worstFrameTime = 0;
+
+enum eRenderBuffer
+{
+  kRenderBuffer_LerpFrom,
+  kRenderBuffer_LerpTo,
+  kRenderBuffer_LerpNext
+};
+byte renderHueOnFace[FACE_COUNT][3];
+#define RENDER_TIMER_RATE 200
+Timer renderTimer;
 
 #if USE_DATA_SPONGE
 byte sponge[143];
@@ -94,7 +111,6 @@ enum eTileRole
   kTileRole_Dripper,
   kTileRole_Dirt,
   kTileRole_Sun,
-  kTileRole_Gravity,
 
   kTileRole_MAX
 };
@@ -107,10 +123,11 @@ char tileRole = kTileRole_Dirt;
 #endif
 
 #define GRAVITY_UP_FACE_UNKNOWN -1
-char gravityUpFace = GRAVITY_UP_FACE_UNKNOWN;
+char gravityUpFace = 0;
 
 #define SUN_SEEN_RATE 500
 char sunSeen;
+char sunBrightness;
 Timer sunSeenTimer;
 
 // -------------------------------------------------------------------------------------------------
@@ -171,7 +188,7 @@ enum eBranchState
   kBranchState_Empty,
   kBranchState_Leaf,
   kBranchState_Branch,
-  kBranchState_Flower   // ??
+  kBranchState_Flower
 };
 struct BranchState
 {
@@ -186,6 +203,11 @@ struct PlantState
   BranchState branches[3];
 };
 PlantState plantState;
+
+#if INCLUDE_BASE_TILES
+#define PLANT_FLOWER_RATE 60000   // blossom a flower after a minute in the right conditions
+Timer plantFlowerTimer;
+#endif
 
 // -------------------------------------------------------------------------------------------------
 // SUN
@@ -212,6 +234,18 @@ Timer sunPulseTimer;
 #define CHECK_GRAVITY_RATE (SEND_GRAVITY_RATE-1000)
 Timer sendGravityTimer;
 
+// -------------------------------------------------------------------------------------------------
+// BUG
+//
+#define BUG_FLAP_RATE 100
+Timer bugFlapTimer;
+#define BUG_MOVE_RATE 7
+
+byte bugTargetCorner  = 0;
+char bugDistance      = 0;
+char bugDirection     = 1;
+byte bugFlapOpen      = 0;
+
 // =================================================================================================
 //
 // COMMUNICATIONS
@@ -227,13 +261,13 @@ struct FaceValue
   byte ack    : 1;
 };
 
-enum NeighborSyncFlag
+enum FaceFlag
 {
-  NeighborSyncFlag_Present    = 1<<0,
-  NeighborSyncFlag_GotWater   = 1<<1,
-  NeighborSyncFlag_SentWater  = 1<<2,
+  FaceFlag_Present    = 1<<0,
+  FaceFlag_GotWater   = 1<<1,
+  FaceFlag_SentWater  = 1<<2,
 
-  NeighborSyncFlag_Debug      = 1<<7
+  FaceFlag_Debug      = 1<<7
 };
 
 struct FaceState
@@ -241,7 +275,7 @@ struct FaceState
   FaceValue faceValueIn;
   FaceValue faceValueOut;
   byte lastCommandIn;
-  byte neighborSyncFlags;
+  byte flags;
   
   byte waterLevel;
   byte waterLevelNew;
@@ -261,21 +295,30 @@ struct FaceState
 };
 FaceState faceStates[FACE_COUNT];
 
-#define NeighborSynced(f) ((faceStates[f].neighborSyncFlags & \
-                              (NeighborSyncFlag_Present | NeighborSyncFlag_GotWater)) == \
-                              (NeighborSyncFlag_Present | NeighborSyncFlag_GotWater))
+#define NeighborSynced(f) ((faceStates[f].flags & \
+                              (FaceFlag_Present | FaceFlag_GotWater)) == \
+                              (FaceFlag_Present | FaceFlag_GotWater))
+
+enum eTransferType
+{
+  kTransferType_Bug
+};
 
 enum CommandType
 {
-  CommandType_None,         // no data
-  CommandType_WaterLevel,   // Our current water level
-  CommandType_WaterAdd,     // Add Water To Neighbor : value=water level to add to the neighbor face
-  CommandType_DistEnergy,   // Distribute Energy : value=energy
-  CommandType_SendSun,      // Send sunlight (sent from Sun tiles): value=sun amount
-  CommandType_SendSunCW,    // Send sunlight (sent from Sun tiles): value=sun amount (turns CW after one tile)
-  CommandType_SendSunCCW,   // Send sunlight (sent from Sun tiles): value=sun amount (turns CCW after one tile)
-  CommandType_GatherSun,    // Gather sun from leaves to root : value=sun amount
-  CommandType_GravityDir,   // Tell neighbor which way gravity points - propagates out from gravity tile
+  CommandType_None,           // no data
+  CommandType_WaterLevel,     // Our current water level
+  CommandType_WaterAdd,       // Add Water To Neighbor : value=water level to add to the neighbor face
+  CommandType_DistEnergy,     // Distribute Energy : value=energy
+  CommandType_SendSun,        // Send sunlight (sent from Sun tiles): value=sun amount
+  CommandType_SendSunCW,      // Send sunlight (sent from Sun tiles): value=sun amount (turns CW after one tile)
+  CommandType_SendSunCCW,     // Send sunlight (sent from Sun tiles): value=sun amount (turns CCW after one tile)
+  CommandType_GatherSun,      // Gather sun from leaves to root : value=sun amount
+  CommandType_GravityDir,     // Tell neighbor which way gravity points - propagates out from gravity tile
+  CommandType_TryTransfer,    // Attempt to transfer something from one tile to another (must be confirmed)
+  CommandType_TryTransferCW,  // Same as above, but transfer to the face CW from the receiver
+  CommandType_TransferAccept, // Confirmation of the transfer - sender must tolerate this never arriving, or arriving late
+  CommandType_BlossomFlower,  // Plant is trying to blossom a flower at the end of a branch
 #if DEBUG_COMMS
   CommandType_UpdateState,
 #endif
@@ -358,7 +401,7 @@ void resetCommOnFace(byte f)
   sendValueOnFace(f, faceState->faceValueOut);
 
   // Clear sync flags dealing with our state
-  faceState->neighborSyncFlags &= ~NeighborSyncFlag_SentWater;
+  faceState->flags &= ~FaceFlag_SentWater;
 }
 
 void sendValueOnFace(byte f, FaceValue faceValue)
@@ -435,7 +478,7 @@ void updateCommOnFaces()
     {
       // Lost the neighbor - no longer in sync
       resetCommOnFace(f);
-      faceStates[f].neighborSyncFlags = 0;
+      faceStates[f].flags = 0;
       continue;
     }
 
@@ -448,7 +491,7 @@ void updateCommOnFaces()
 
     FaceState *faceState = &faceStates[f];
 
-    faceState->neighborSyncFlags |= NeighborSyncFlag_Present;
+    faceState->flags |= FaceFlag_Present;
 
     // Read the neighbor's face value it is sending to us
     byte val = getLastValueReceivedOnFace(f);
@@ -553,12 +596,18 @@ void updateCommOnFaces()
 
 void loop()
 {
-  // Clamp frame time at 250 ms to fit within a byte
-  // Hopefully processing doesn't ever take longer than that for one frame
+  // Keep track of time
   unsigned long previousTime = currentTime;
   currentTime = millis();
+
+  // Clamp frame time at 255 ms to fit within a byte
+  // Hopefully processing doesn't ever take longer than that for one frame
   unsigned long timeSinceLastLoop = currentTime - previousTime;
-  frameTime = (timeSinceLastLoop > 250) ? 250 : 0;
+  frameTime = (timeSinceLastLoop > 255) ? 255 : (timeSinceLastLoop & 0xFF);
+  if (frameTime > worstFrameTime)
+  {
+    worstFrameTime = frameTime;
+  }
   
   // User input
   updateUserSelection();
@@ -586,14 +635,14 @@ void loop()
     case kTileRole_Base:
       loopWater();
       loopPlant();
+      loopBug();
       break;
 #endif
       
 #if INCLUDE_SPECIAL_TILES
-    case kTileRole_Dripper:  loopDripper();  break;
+    case kTileRole_Dripper:  loopDripper();  loopGravity();  break;
     case kTileRole_Dirt:     loopDirt();     break;
     case kTileRole_Sun:      loopSun();      break;
-    case kTileRole_Gravity:  loopGravity();  break;
 #endif
   }  
 
@@ -620,6 +669,12 @@ void updateUserSelection()
   {
     // Reset our state and tell our neighbors to reset their perception of us
     resetOurState();
+
+    // Give ourselves a bug!
+    if (tileRole == kTileRole_Base)
+    {
+      tileFlags |= kTileFlag_HasBug;
+    }
   }
 
 #if INCLUDE_SPECIAL_TILES
@@ -664,7 +719,7 @@ void updateUserSelection()
   }  // buttonDoubleClicked
 #endif
 
-  if (buttonSingleClicked())
+  if (buttonSingleClicked() && !hasWoken())
   {
 #if INCLUDE_SPECIAL_TILES
     switch (tileRole)
@@ -683,15 +738,6 @@ void updateUserSelection()
         {
           sunStrengthScale = 1;
         }
-        break;
-
-      case kTileRole_Gravity:
-        gravityUpFace++;
-        if (gravityUpFace >= FACE_COUNT)
-        {
-          gravityUpFace = 0;
-        }
-        sendGravityTimer.set(1);
         break;
     }
 #endif
@@ -715,7 +761,7 @@ void resetOurState()
     FaceState *faceState = &faceStates[f];
 
     // Clear sync flags dealing with our state
-    faceState->neighborSyncFlags &= ~NeighborSyncFlag_SentWater;
+    faceState->flags &= ~FaceFlag_SentWater;
 
     switch (tileRole)
     {
@@ -723,26 +769,7 @@ void resetOurState()
         faceState->waterLevel = 0;
         faceState->waterLevelNew = 0;
 
-#if 1
         memclr((byte*) &plantState, sizeof(plantState));
-/*
-        byte *ptr = (byte*) &plantState;
-        byte *ptrEnd = (byte*) &plantState + sizeof(plantState);
-        while (ptr != ptrEnd)
-        {
-          *ptr = 0;
-          ptr++;
-        }
-        */
-#else
-        plantState.branches[0].state = kBranchState_Empty;
-        plantState.branches[1].state = kBranchState_Empty;
-        plantState.branches[2].state = kBranchState_Empty;
-        plantState.branches[0].growthEnergy = 0;
-        plantState.branches[1].growthEnergy = 0;
-        plantState.branches[2].growthEnergy = 0;
-        plantState.energyTotal = 0;
-#endif
         break;
 
 #if INCLUDE_SPECIAL_TILES
@@ -773,6 +800,7 @@ void resetOurState()
 #endif
 
   tileFlags = 0;
+  worstFrameTime = 0;
 }
 
 void processCommForFace(CommandType command, byte value, byte f)
@@ -784,7 +812,7 @@ void processCommForFace(CommandType command, byte value, byte f)
   {
     case CommandType_WaterLevel:
       faceState->waterLevelNeighbor = value;
-      faceState->neighborSyncFlags |= NeighborSyncFlag_GotWater;
+      faceState->flags |= FaceFlag_GotWater;
       break;
       
     case CommandType_WaterAdd:
@@ -888,7 +916,7 @@ void processCommForFace(CommandType command, byte value, byte f)
         {
           faceOffset = 4;   // special case when sent out of a sun tile to make sunshine 3 hexes wide
         }
-        byte exitFace = CCW_FROM_FACE(f, faceOffset);
+        byte exitFace = CW_FROM_FACE(f, faceOffset);
         enqueueCommOnFace(exitFace, CommandType_SendSun, value, true);
       }
       break;
@@ -905,18 +933,26 @@ void processCommForFace(CommandType command, byte value, byte f)
             gatheredSun += value;
           }
 
-/*
           // When receiving sun, convert our leaves to branches
           char faceOffsetFromRoot = plantState.rootFace - f;
           if (faceOffsetFromRoot == 2 || faceOffsetFromRoot == -4)
           {
-            plantState.branches[1].state = kBranchState_Branch;
+            // Still growing - don't spawn a flower yet
+            if (plantState.branches[2].state != kBranchState_Branch)
+            {
+              resetFlowerTimer();
+            }
+            plantState.branches[2].state = kBranchState_Branch;
           }
           else if (faceOffsetFromRoot == 4 || faceOffsetFromRoot == -2)
           {
-            plantState.branches[2].state = kBranchState_Branch;
+            // Still growing - don't spawn a flower yet
+            if (plantState.branches[1].state != kBranchState_Branch)
+            {
+              resetFlowerTimer();
+            }
+            plantState.branches[1].state = kBranchState_Branch;
           }
-*/
         }
       }
 #endif
@@ -934,7 +970,7 @@ void processCommForFace(CommandType command, byte value, byte f)
       break;
 
     case CommandType_GravityDir:
-      if (tileRole != kTileRole_Gravity)
+      if (tileRole != kTileRole_Dripper)    // dripper now sends out the gravity
       {
         if (sendGravityTimer.isExpired())
         {
@@ -948,6 +984,69 @@ void processCommForFace(CommandType command, byte value, byte f)
         }
       }
       break;
+
+#if INCLUDE_BASE_TILES
+    case CommandType_TryTransfer:
+    case CommandType_TryTransferCW:
+    {
+      eTransferType transferType = value;
+      switch (transferType)
+      {
+        case kTransferType_Bug:
+          if (!(tileFlags & kTileFlag_HasBug))
+          {
+            // No bug in this tile - transfer accepted
+            tileFlags |= kTileFlag_HasBug;
+            bugTargetCorner = (command == CommandType_TryTransfer) ? f : CW_FROM_FACE(f, 1);
+            bugDistance  = 64;
+            bugDirection = -1;  // start going towards the middle
+            bugFlapOpen = 0;    // looks better starting closed
+            
+            // Notify the sender
+            enqueueCommOnFace(f, CommandType_TransferAccept, value, false);
+          }
+          break;
+      }
+    }
+      break;
+
+    case CommandType_TransferAccept:
+    {
+      eTransferType transferType = value;
+      switch (transferType)
+      {
+        case kTransferType_Bug:
+          // Bug transferred! Remove ours
+          tileFlags &= ~kTileFlag_HasBug;
+          break;
+      }
+    }
+      break;
+#endif
+
+#if INCLUDE_BASE_TILES
+    case CommandType_BlossomFlower:
+      if (tileRole == kTileRole_Base)
+      {
+        // Can only grow a flower if there is no other plant growing in this tile
+        if (plantState.branches[0].state == kBranchState_Empty)
+        {
+          plantState.rootFace = f;
+          plantState.branches[0].state = kBranchState_Flower;
+
+          // Spawn a bug, if we can!
+          if (!(tileFlags & kTileFlag_HasBug))
+          {
+            tileFlags |= kTileFlag_HasBug;
+            bugTargetCorner = MAX(5, currentTime & 0x7);
+//            bugDistance = 0;
+//            bugDirection = 1;
+//            bugFlapOpen = 0;
+          }
+        }
+      }
+      break;
+#endif
     
 #if DEBUG_COMMS
     case CommandType_UpdateState:
@@ -991,9 +1090,9 @@ void postProcessState()
     }
 
     // If we haven't sent our water level then do that now
-    if (faceState->neighborSyncFlags & NeighborSyncFlag_Present)
+    if (faceState->flags & FaceFlag_Present)
     {
-      if (!(faceState->neighborSyncFlags & NeighborSyncFlag_SentWater))
+      if (!(faceState->flags & FaceFlag_SentWater))
       {
         byte waterLevel = faceState->waterLevel;
         switch (tileRole)
@@ -1017,15 +1116,10 @@ void postProcessState()
             // Dirt absorbs water over the entire tile
             waterLevel = getDirtWaterLevelToSend();
             break;
-            
-          case kTileRole_Gravity:
-            // Drippers cannot accept water - it just falls around them
-            waterLevel = MAX_WATER_LEVEL;
-            break;
 #endif
         }
         replaceOrEnqueueCommOnFace(f, CommandType_WaterLevel, waterLevel, true);
-        faceState->neighborSyncFlags |= NeighborSyncFlag_SentWater;
+        faceState->flags |= FaceFlag_SentWater;
       }
     }
   }
@@ -1048,7 +1142,7 @@ void postProcessState()
             }
             else
             {
-              faceStates[f].waterLevel == 0;
+              faceStates[f].waterLevel = 0;
             }
             
             replaceOrEnqueueCommOnFace(f, CommandType_WaterLevel, faceStates[f].waterLevel, true);
@@ -1349,6 +1443,9 @@ void loopPlant()
             // No more growth energy - this branch is dead
             plantState.branches[branchIndex].state = kBranchState_Empty;
           }
+
+          // Flower can't grow in these conditions!
+          resetFlowerTimer();
         }
       }
     }
@@ -1391,21 +1488,42 @@ void loopPlant()
         // Once reach max growth level, sprout a leaf!
         if (plantState.branches[branchIndex].growthEnergy == 3)
         {
+          // Still growing - don't spawn a flower yet
+          resetFlowerTimer();
+
           plantState.branches[branchIndex].state = kBranchState_Leaf;
 
-/*
           // Leaves on the outer branches convert the root to a branch
           if (branchIndex > 0)
           {
             plantState.branches[0].state = kBranchState_Branch;
           }
-*/
         }
 
         // If the root branch is still growing, don't process the other branches
         if (branchIndex == 0)
         {
           break;
+        }
+      }
+    }
+
+    // Flowers can only blossom in the presences of sunlight
+    if (sunSeen == 0)
+    {
+      resetFlowerTimer();
+    }
+    
+    // Check about converting leaves into flowers
+    if (plantFlowerTimer.isExpired())
+    {
+      resetFlowerTimer();
+      for (int branchIndex = 1; branchIndex < 3; branchIndex++)
+      {
+        if (plantState.branches[branchIndex].state == kBranchState_Leaf)
+        {
+          byte leafFace = CW_FROM_FACE(plantState.rootFace, 2 * branchIndex);
+          enqueueCommOnFace(leafFace, CommandType_BlossomFlower, 0, false);
         }
       }
     }
@@ -1425,7 +1543,7 @@ void loopPlant()
         for (int branchIndex = 1; branchIndex < 3; branchIndex++)
         {
           // Branch is either 2 or 4 faces away from the root
-          byte leafFace = CCW_FROM_FACE(plantState.rootFace, 2 * branchIndex);
+          byte leafFace = CW_FROM_FACE(plantState.rootFace, 2 * branchIndex);
           enqueueCommOnFace(leafFace, CommandType_DistEnergy, energyToSend, true);
         }
       
@@ -1456,6 +1574,11 @@ void loopPlant()
     
     plantEnergyTimer.set(PLANT_ENERGY_RATE);
   }
+}
+
+void resetFlowerTimer()
+{
+  plantFlowerTimer.set(PLANT_FLOWER_RATE);
 }
 #endif
 
@@ -1492,13 +1615,6 @@ void loopSun()
 #if INCLUDE_SPECIAL_TILES
 void loopGravity()
 {
-  // Initialize gravity to an arbitrary direction
-  if (gravityUpFace == GRAVITY_UP_FACE_UNKNOWN)
-  {
-    gravityUpFace = 0;
-    sendGravityTimer.set(1000);  // force to send soonish
-  }
-  
   if (sendGravityTimer.isExpired())
   {
     // Tell neighbors how many faces away is "up".
@@ -1539,12 +1655,259 @@ void propagateGravityDir(byte exceptFace)
 
 // =================================================================================================
 //
+// BUG
+//
+// =================================================================================================
+
+void loopBug()
+{
+  if (tileFlags & kTileFlag_HasBug)
+  {
+    // Did the bug flap its wings?
+    if (bugFlapTimer.isExpired())
+    {
+      // Could just do X=1-X, but this is more readable
+      bugFlapOpen = 1 - bugFlapOpen;
+      bugFlapTimer.set(BUG_FLAP_RATE);
+
+      // Move the bug along its path
+      if (bugDirection == 0)
+      {
+        // Just sit there I guess?
+      }
+      else
+      {
+        bugDistance += (bugDirection > 0) ? BUG_MOVE_RATE : -BUG_MOVE_RATE;
+        if (bugDistance > 64)
+        {
+          // Start moving back towards the center
+          bugDistance = 64;
+          bugDirection = -1;
+          
+          // While doing this, try to transfer to neighbor cell
+          // If the transfer is accepted then the bug will leave this tile
+          byte otherFace = CCW_FROM_FACE(bugTargetCorner, 1);
+          byte tryTransferToFace = 0;
+          CommandType commandType = CommandType_None;
+          if (NeighborSynced(bugTargetCorner))
+          {
+            tryTransferToFace = bugTargetCorner;
+            commandType = CommandType_TryTransferCW;
+          }
+          else if (NeighborSynced(otherFace))
+          {
+            // Choose the other face if the first face isn't present
+            // If both faces are present, then do a coin flip
+            // Using the LSB of the time *should* be random enough for a coin flip
+            if (tryTransferToFace == 0 || currentTime & 0x1)
+            {
+              tryTransferToFace = otherFace;
+              commandType = CommandType_TryTransfer;
+            }
+          }
+
+          enqueueCommOnFace(tryTransferToFace, commandType, kTransferType_Bug, false);
+        }
+        else if (bugDistance < 0)
+        {
+          bugDistance = 0;
+          bugDirection = 1;
+          // Pick a different corner
+          char offset = 3;
+          switch (currentTime & 0x3)
+          {
+            case 0: offset = 3; break;
+            case 1: offset = 2; break;
+            case 2: offset = 3; break;
+            case 3: offset = 4; break;
+          }
+          bugTargetCorner = CW_FROM_FACE(bugTargetCorner, offset);
+        }
+      }
+
+    }
+  }
+}
+
+// =================================================================================================
+//
 // RENDER
 //
 // =================================================================================================
 
+#if NEW_RENDER
 void render()
 {
+#if INCLUDE_BASE_TILES
+  // Render algorithm
+  //
+  // Plants are in the background and fade in while growing/dying using the render timer
+  // Bugs obscure plants (fly in front of them) and are immediate - they flap too fast to fade in/out
+  // Water adjusts the rendered hue to be more blue
+  // Sun adjusts the brightness according to how much sun the tile saw
+  if (tileRole == kTileRole_Base)
+  {
+    // Clear the color
+    FOREACH_FACE(f)
+    {
+      renderHueOnFace[f][kRenderBuffer_LerpNext] = 0;
+    }
+    
+    // PLANT
+    for (int branchIndex = 0; branchIndex < 3; branchIndex++)
+    {
+      byte leafFace = CW_FROM_FACE(plantState.rootFace, 2 * branchIndex);
+      switch (plantState.branches[branchIndex].state)
+      {
+        case kBranchState_Branch:
+          renderHueOnFace[leafFace][kRenderBuffer_LerpNext] = HUE_BRANCH;
+          break;
+
+        case kBranchState_Leaf:
+          renderHueOnFace[leafFace][kRenderBuffer_LerpNext] = HUE_LEAF;
+          break;
+          
+        case kBranchState_Flower:
+          renderHueOnFace[leafFace][kRenderBuffer_LerpNext] = HUE_FLOWER;
+          break;
+      }
+    }
+
+    // BUG
+    if (tileFlags &= kTileFlag_HasBug)
+    {
+      if (bugFlapOpen == 0)
+      {
+        renderHueOnFace[bugTargetCorner][kRenderBuffer_LerpNext] = HUE_BUG;
+        renderHueOnFace[CW_FROM_FACE(bugTargetCorner, 5)][kRenderBuffer_LerpNext] = HUE_BUG;
+      }
+      else  // must be BUG_FLAP_OPENED
+      {
+        renderHueOnFace[CW_FROM_FACE(bugTargetCorner, 1)][kRenderBuffer_LerpNext] = HUE_BUG;
+        renderHueOnFace[CW_FROM_FACE(bugTargetCorner, 4)][kRenderBuffer_LerpNext] = HUE_BUG;
+      }
+    }
+
+    FOREACH_FACE(f)
+    {
+      // Factor in water
+      if (faceStates[f].waterLevel > 0)
+      {
+        // If there is no other color already present, just make it blue
+        if (renderHueOnFace[f][kRenderBuffer_LerpNext] == 0)
+        {
+          renderHueOnFace[f][kRenderBuffer_LerpNext] = HUE_WATER;
+        }
+        else
+        {
+          /*
+          // Otherwise, skew the hue towards blue
+          // Keep brightness as is
+          renderHueOnFace[f][kRenderBuffer_LerpNext] = HUE_WATER;
+          if (renderHueOnFace[f][kRenderBuffer_LerpNext] > (HUE_WATER - 128))
+          {
+            renderHueOnFace[f][kRenderBuffer_LerpNext] = (renderHueOnFace[f][kRenderBuffer_LerpNext] + HUE_WATER) >> 1;
+          }
+          else
+          {
+            renderHueOnFace[f][kRenderBuffer_LerpNext] = 255 - 42 - (renderHueOnFace[f][kRenderBuffer_LerpNext] >> 1);
+          }
+          */
+        }
+      }
+    }
+
+    // Render the actual color
+    // Linearly interpolate between the current and next color to avoid jarring transitions
+    FOREACH_FACE(f)
+    {
+      // Did time wrap around?
+      byte t = currentTime & 0xFF;
+      if (frameTime > t)
+      {
+        // Swap buffers!
+        renderHueOnFace[f][kRenderBuffer_LerpFrom] = renderHueOnFace[f][kRenderBuffer_LerpTo];
+        renderHueOnFace[f][kRenderBuffer_LerpTo] = renderHueOnFace[f][kRenderBuffer_LerpNext];
+      }
+
+      // Factor in sunlight, but only on faces that actually have something there
+      byte bFrom = 128;
+      if (renderHueOnFace[f][kRenderBuffer_LerpFrom] != 0 &&
+          renderHueOnFace[f][kRenderBuffer_LerpFrom] != HUE_WATER)
+      {
+        bFrom += (sunSeen >= 0) ? 127 : sunSeen * 16;
+      }
+      byte bTo = 128;
+      if (renderHueOnFace[f][kRenderBuffer_LerpTo] != 0 &&
+          renderHueOnFace[f][kRenderBuffer_LerpTo] != HUE_WATER)
+      {
+        bTo += (sunSeen >= 0) ? 127 : sunSeen * 16;
+      }
+
+      // Lerp in RGB space since it's easier
+      Color colorFrom = makeColorHSB(renderHueOnFace[f][kRenderBuffer_LerpFrom], 255, bFrom);
+      Color colorTo   = makeColorHSB(renderHueOnFace[f][kRenderBuffer_LerpTo],   255, bTo  );
+
+      byte r = (colorFrom.r * (0xFF - t) + colorTo.r * t) >> 8;
+      byte g = (colorFrom.g * (0xFF - t) + colorTo.g * t) >> 8;
+      byte b = (colorFrom.b * (0xFF - t) + colorTo.b * t) >> 8;
+
+      setColorOnFace(makeColorRGB(r, g, b), f);
+      //setColorOnFace(colorFrom, f);
+    }
+
+/*
+    if (worstFrameTime & 0x80)
+    {
+      setColorOnFace(WHITE, 0);
+    }
+    if (worstFrameTime & 0x40)
+    {
+      setColorOnFace(WHITE, 1);
+    }
+    if (worstFrameTime & 0x20)
+    {
+      setColorOnFace(WHITE, 2);
+    }
+    if (worstFrameTime & 0x10)
+    {
+      setColorOnFace(WHITE, 3);
+    }
+    if (worstFrameTime & 0x8)
+    {
+      setColorOnFace(WHITE, 4);
+    }
+    if (worstFrameTime & 0x4)
+    {
+      setColorOnFace(WHITE, 5);
+    }
+*/
+  }
+#endif
+}
+#else
+byte getWaveBrightness(byte state, byte value)
+{
+  switch (state)
+  {
+    case 0: return 0; break;
+    case 1: return value; break;
+    case 2: return 255; break;
+    case 3: return 255 - value; break;
+  }
+
+  return 255;
+}
+
+char waveFacePairs[][2]
+{
+  {0, 0}, {1, 5}, {2, 4}, {3, 3}
+};
+
+void render()
+{
+  Color color;
+  
   setColor(OFF);
 
   // Show the base tile state first
@@ -1558,6 +1921,68 @@ void render()
 #if INCLUDE_SPECIAL_TILES
     case kTileRole_Dripper:
       {
+#if NEW_DRIPPER_RENDER
+        unsigned long timeForWave = currentTime << dripperSpeedScale;
+        unsigned long timeDiff = 512;
+
+        for (int waveFacePairIndex = 0; waveFacePairIndex < 4; waveFacePairIndex++)
+        {
+          byte brightness = getWaveBrightness((timeForWave & 0x600) >> 9, timeForWave >> 1);
+          color = makeColorHSB(HUE_DRIPPER, 255, brightness);
+          setColorOnFace(color, waveFacePairs[waveFacePairIndex][0]);
+          setColorOnFace(color, waveFacePairs[waveFacePairIndex][1]);
+          timeForWave -= timeDiff;
+        }
+
+        /*
+        brightness = getWaveBrightness((timeForWave & 0x600) >> 9, timeForWave >> 1);
+        color = makeColorHSB(HUE_DRIPPER, 255, brightness);
+        setColorOnFace(color, 1);
+        setColorOnFace(color, 5);
+        
+        timeForWave -= timeDiff;
+        brightness = getWaveBrightness((timeForWave & 0x600) >> 9, timeForWave >> 1);
+        color = makeColorHSB(HUE_DRIPPER, 255, brightness);
+        setColorOnFace(color, 2);
+        setColorOnFace(color, 4);
+        
+        timeForWave -= timeDiff;
+        brightness = getWaveBrightness((timeForWave & 0x600) >> 9, timeForWave >> 1);
+        color = makeColorHSB(HUE_DRIPPER, 255, brightness);
+        setColorOnFace(color, 3);
+        */
+        
+/*
+        // Make a wave animation flowing down the tile in the direction of gravity
+        unsigned long timeForWave = currentTime << dripperSpeedScale;
+        unsigned long timeDiff = 256;
+        byte brightness = 0;
+        switch (timeForWave & 0x600)
+        {
+          case 0x000: brightness = 0; break;
+          case 0x200: brightness = (timeForWave & 0x1FF) >> 1; break;
+          case 0x400: brightness = 255; break;
+          case 0x600: brightness = 255 - ((timeForWave & 0x1FF) >> 1); break;
+        }
+        color = makeColorHSB(HUE_DRIPPER, 255, brightness);
+        setColorOnFace(color, 5);
+        setColorOnFace(color, 0);
+        setColorOnFace(color, 1);
+
+        timeForWave -= timeDiff;
+        switch (timeForWave & 0x600)
+        {
+          case 0x000: brightness = 0; break;
+          case 0x200: brightness = (timeForWave & 0x1FF) >> 1; break;
+          case 0x400: brightness = 255; break;
+          case 0x600: brightness = 255 - ((timeForWave & 0x1FF) >> 1); break;
+        }
+        color = makeColorHSB(HUE_DRIPPER, 255, brightness);
+        setColorOnFace(color, 2);
+        setColorOnFace(color, 3);
+        setColorOnFace(color, 4);
+*/
+#else
         // Make a wave around the tile
         // Cycle every 2 seconds (2048 ms)
         // Brighter/faster as the dripper rate increases
@@ -1574,15 +1999,16 @@ void render()
   
           byte brightness = baseBrightness + (((255 - baseBrightness) * brightnessScale) >> 8);
           
-          setColorOnFace(makeColorHSB(COLOR_DRIPPER_HUE, 255, brightness), f);
+          setColorOnFace(makeColorHSB(HUE_DRIPPER, 255, brightness), f);
           timeForFace += faceTimeDiff;
         }
+#endif
       }
       break;
 
     case kTileRole_Dirt:
       {
-        setColor(COLOR_DIRT);
+        setColor(makeColorHSB(HUE_DIRT, 255, 128 + sunBrightness));
         /*
 #if DEBUG_COLORS
         if (dirtReservoir >= MAX_DIRT_WATER)
@@ -1610,13 +2036,9 @@ void render()
             brightness = 255 - brightness;
           }
             
-          setColorOnFace(makeColorHSB(COLOR_SUN_HUE, 255, brightness), f);
+          setColorOnFace(makeColorHSB(HUE_SUN, 255, brightness), f);
         }
       }
-      break;
-
-    case kTileRole_Gravity:
-      setColorOnFace(WHITE, gravityUpFace);
       break;
 #endif
   }
@@ -1625,7 +2047,7 @@ void render()
   {
     FOREACH_FACE(f)
     {
-//#if DEBUG_COLORS
+#if DEBUG_COLORS
       // Sun in the very background
       // Would be nice to eventually have the sun light up the other elements
       {
@@ -1636,15 +2058,16 @@ void render()
         }
   
         byte sunDim = sunPulseTimer.getRemaining() >> 2;
-        setColorOnFace(dim(makeColorHSB(COLOR_SUN_HUE, 255, 255), sunDim), f);
+        setColorOnFace(dim(makeColorHSB(HUE_SUN, 255, 255), sunDim), f);
       }
-//#endif
+#endif
 
       // Water overrides sun
       if (faceStates[f].waterLevel > 0)
       {
-        byte dimness = faceStates[f].waterLevel << 4;    // water level 1 = brightness 16
-        Color waterColor = dim(COLOR_WATER, dimness);
+//        byte dimness = faceStates[f].waterLevel << 4;    // water level 1 = brightness 16
+//        Color waterColor = dim(COLOR_WATER, dimness);
+        color = makeColorHSB(HUE_WATER, 255, 64);// + sunBrightness);
 #if DEBUG_COLORS
         if (faceStates[f].waterLevel >= MAX_WATER_LEVEL)
         {
@@ -1684,13 +2107,13 @@ void render()
           }
         }
 #endif
-        setColorOnFace(waterColor, f);
+        setColorOnFace(color, f);
       }
 
       // Plant in the foreground
       for (int branchIndex = 0; branchIndex < 3; branchIndex++)
       {
-        byte leafFace = CCW_FROM_FACE(plantState.rootFace, 2 * branchIndex);
+        byte leafFace = CW_FROM_FACE(plantState.rootFace, 2 * branchIndex);
         switch (plantState.branches[branchIndex].state)
         {
 #if DEBUG_COLORS
@@ -1712,22 +2135,36 @@ void render()
           break;
 #endif
 
-/*
           case kBranchState_Branch:
-            setColorOnFace(COLOR_BRANCH, leafFace);
+            color = makeColorHSB(HUE_BRANCH, 255, 128 + sunBrightness);
+            setColorOnFace(color, leafFace);
             break;
-*/
 
           case kBranchState_Leaf:
-          {
-            byte dimness = 128;
-            if (plantState.branches[branchIndex].didGatherSun)
-            {
-              //dimness = 255;
-            }
-            setColorOnFace(dim(COLOR_LEAF, dimness), leafFace);
-          }
-          break;
+            color = makeColorHSB(HUE_LEAF, 255, 128 + sunBrightness);
+            setColorOnFace(color, leafFace);
+            break;
+            
+          case kBranchState_Flower:
+            color = makeColorHSB(HUE_FLOWER, 255, 128 + sunBrightness);
+            setColorOnFace(color, leafFace);
+            break;
+        }
+      }
+
+      // Bug in front of plant
+      if (tileFlags &= kTileFlag_HasBug)
+      {
+        color = makeColorHSB(HUE_BUG, 255, 128 + sunBrightness);
+        if (bugFlapOpen == 0)
+        {
+          setColorOnFace(color, bugTargetCorner);
+          setColorOnFace(color, CW_FROM_FACE(bugTargetCorner, 5));
+        }
+        else  // must be BUG_FLAP_OPENED
+        {
+          setColorOnFace(color, CW_FROM_FACE(bugTargetCorner, 1));
+          setColorOnFace(color, CW_FROM_FACE(bugTargetCorner, 4));
         }
       }
     }
@@ -1744,7 +2181,7 @@ void render()
   // Error codes
   FOREACH_FACE(f)
   {
-    if (faceStates[f].neighborSyncFlags & NeighborSyncFlag_Debug)
+    if (faceStates[f].flags & FaceFlag_Debug)
     {
       setColorOnFace(makeColorRGB(255,128,64), f);
     }
@@ -1806,8 +2243,21 @@ void render()
   // Deal with this here because it affects how the tile renders
   if (sunSeenTimer.isExpired())
   {
-    sunSeen = 0;
+    sunBrightness = (sunSeen > 0) ? 127 : (sunSeen << 4);
+    /*
+    byte newSunBrightness = (sunSeen >= 8) ? 127 : (sunSeen << 4);
+    if (newSunBrightness > sunBrightness)
+    {
+      sunBrightness = newSunBrightness;
+    }
+    else if (sunBrightness > 0)
+    {
+      sunBrightness--;
+    }
+    */
+
+    sunSeen = sunSeen >> 1;
     sunSeenTimer.set(SUN_SEEN_RATE);
   }
-
 }
+#endif  // NEW_RENDER
